@@ -1,47 +1,69 @@
-# LLM FCL Prototype
+# LLM-guided Federated Continual Learning (LLM-FCL)
 
-## Overview
-The LLM FCL Prototype is a foundational project designed to demonstrate the integration of Large Language Models (LLMs) within a functional application. This project serves as a starting point for building more complex systems that leverage LLM capabilities.
+Prototype research project exploring how **Large Language Models (LLMs)** can guide
+**Federated Continual Learning (FCL)** strategies in image classification tasks.
 
-## Project Structure
-```
+## 📂 Project Structure
 llm_fcl_prototype
 ├── src
-│   ├── app.py               # Main entry point of the application
-│   ├── services             # Directory for service-related functions or classes
-│   │   └── __init__.py
-│   ├── routes               # Directory for defining application routes
-│   │   └── __init__.py
-│   └── types                # Directory for custom types or data models
-│       └── __init__.py
-├── requirements.txt         # List of dependencies for the project
-├── README.md                # Documentation for the project
-└── .gitignore               # Files and directories to ignore by Git
-```
+│   ├── run_llm_fcl.py        # Main training loop (entry point)
+│   ├── data.py               # Dataset loading + client splits
+│   ├── model.py              # Model definitions (e.g., ResNet18)
+│   ├── fl.py                 # Federated Learning logic (Client, Server, FedAvg)
+│   ├── policy.py             # LLM-guided policy for tuning hyperparams
+│   └── strategies            # Continual learning strategies
+│       ├── replay.py         # Replay buffer
+│       └── ewc.py            # Elastic Weight Consolidation (optional)
+├── prompts
+│   └── policy_prompt.txt     # Prompt template for the LLM policy
+├── experiments
+│   └── plan.md               # Experiment plan & notes
+├── requirements.txt          # Python dependencies
+├── README.md                 # Documentation
+└── .gitignore                # Git ignore file
 
-## Setup Instructions
-1. **Clone the repository:**
-   ```
-   git clone https://github.com/yourusername/llm_fcl_prototype.git
-   cd llm_fcl_prototype
-   ```
+---
 
-2. **Install dependencies:**
-   ```
-   pip install -r requirements.txt
-   ```
+## 🚀 Getting Started
 
-3. **Run the application:**
-   ```
-   python src/app.py
-   ```
+### 1. Clone the repo
+```bash
+git clone https://github.com/<your-username>/llm_fcl_prototype.git
+cd llm_fcl_prototype
 
-## Usage
-- The application can be accessed at `http://localhost:5000` after starting the server.
-- Expand the `services`, `routes`, and `types` directories to add functionality as needed.
+2. Install dependencies
+pip install -r requirements.txt
 
-## Contributing
-Contributions are welcome! Please submit a pull request or open an issue for any enhancements or bug fixes.
+3. Run the prototype (step-by-step implementation)
+python -m src.run_llm_fcl
 
-## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+📝 Roadmap
+	•	Repo scaffold created
+	•	Implement data loading (CIFAR-100 with non-IID client splits)
+	•	Add ResNet18 model
+	•	Implement Federated Learning (FedAvg)
+	•	Add Continual Learning strategies (Replay, EWC)
+	•	Connect LLM-guided policy
+	•	Run experiments & generate plots
+
+   📖 Research Context
+
+This project builds on previous work in:
+	•	Federated Learning (FL): collaborative model training without centralizing data.
+	•	Continual Learning (CL): adapting models to evolving data streams while mitigating catastrophic forgetting.
+	•	Federated Continual Learning (FCL): combines FL and CL, but suffers from instability under non-IID data.
+	•	LLMs for meta-learning: here we explore if LLMs can guide hyperparameter tuning or replay strategies dynamically.
+
+⸻
+
+📊 Planned Experiments
+	•	Baselines: FedAvg + Replay (fixed), FedAvg + Replay + EWC (fixed).
+	•	LLM-FCL: LLM-guided dynamic tuning of replay ratio, learning rate, and EWC λ.
+	•	Datasets: CIFAR-100, TrashNet, and optionally DWRL if available.
+	•	Metrics: accuracy, per-class recall, forgetting, stability.
+
+⸻
+
+🧑‍💻 Authors
+	•	Somayeh Shami (PhD candidate, TU Graz)
+	•	Collaborators: [to be added]
