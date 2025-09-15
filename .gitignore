@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Data & logs
+data/
+experiments/logs/
+
+# VSCode settings
+.vscode/
