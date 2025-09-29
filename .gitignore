@@ -7,4 +7,4 @@ data/
 experiments/logs/
 
 # VSCode settings
-.vscode/
+.vscode/.DS_Store
