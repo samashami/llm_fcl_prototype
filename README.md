@@ -67,3 +67,19 @@ This project builds on previous work in:
 🧑‍💻 Authors
 	•	Somayeh Shami (PhD candidate, TU Graz)
 	•	Collaborators: [to be added]
+## 📊 Results (CIFAR-100 pilot)
+
+**Setup:** ResNet-18 (ImageNet pretrained), 4 clients (α=0.2), 2 epochs/round, 3k images/client, batch 128, SGD lr=1e-3, replay on.
+
+| Round | Baseline Acc | Policy Acc | Policy LR | Policy Replay |
+|------:|-------------:|-----------:|-----------:|--------------:|
+| -1    | 0.010        | 0.010      | 0.00800    | 0.20 |
+| 0     | 0.052        | 0.129      | 0.00960    | 0.25 |
+| 1     | 0.164        | 0.404      | 0.01152    | 0.30 |
+| 2     | 0.274        | 0.561      | 0.01382    | 0.35 |
+| 3     | 0.335        | 0.621      | 0.01659    | 0.40 |
+| 4     | 0.378        | 0.658      | —          | — |
+
+**Summary:** The adaptive policy outperforms fixed hyperparameters by **+28.0 pp** at Round 4 (65.8% vs 37.8%), mainly by ramping LR (≈0.008→0.0166) and replay (0.20→0.40).  
+See details in `experiments/results/cifar100_policy_vs_baseline_subset3000_rounds5.md`.
+
