@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--use_policy", action="store_true", help="enable LLM-like policy controller")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--log_interval", type=int, default=200, help="batches between progress prints")
 
     args = ap.parse_args()
     set_seeds(args.seed)
@@ -100,7 +101,7 @@ def main():
     # datasets
     trainset = datasets.CIFAR100(root="./data", train=True, download=True, transform=tf_train)
     testset  = datasets.CIFAR100(root="./data", train=False, download=True, transform=tf_test)
-    test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=0)
+    test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
 
     # non-IID client splits
     splits = make_cifar100_splits(trainset.targets, n_clients=args.clients, alpha=args.alpha, seed=args.seed)
@@ -113,7 +114,7 @@ def main():
     clients = []
     for cid, idx in enumerate(splits):
         subset = Subset(trainset, idx)
-        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
         model = build_resnet18(100).to(device)
         opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
         replay = ReplayBuffer(capacity=2000)
@@ -158,8 +159,14 @@ def main():
 
         # local training
         for c in clients:
-            for _ in range(args.epochs):
-                c.train_one_epoch(replay_ratio=hp["replay_ratio"])
+            print(f"[Round {r}] training client {c.cid} on {next(c.model.parameters()).device}", flush=True)
+            for e in range(args.epochs):
+                c.train_one_epoch(
+                    replay_ratio=hp["replay_ratio"],
+                    epoch=e,
+                    total_epochs=args.epochs,
+                    log_interval=args.log_interval,
+                )
 
         # aggregate & eval
         global_model = server.average([c.model for c in clients])
