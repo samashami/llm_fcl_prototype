@@ -149,7 +149,7 @@ def main():
             hp = policy.decide(summary)
         else:
             hp = {"lr": args.lr, "replay_ratio": 0.20, "notes": "fixed (baseline)"}
-        print(f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} -> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f}  ({hp['notes']})")
+        print(f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} -> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f}  ({hp['notes']})", flush=True)
 
         # broadcast global
         for c in clients:
@@ -174,7 +174,7 @@ def main():
         acc, per_class = evaluate(global_model, device, test_loader)
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
-        print(f"[Round {r}] acc={acc:.3f}")
+        print(f"[Round {r}] acc={acc:.3f}", flush=True)
 
 
 
