@@ -68,6 +68,7 @@ def main():
     set_seeds(args.seed)
 
     device = torch.device(args.device)
+    print(f"Using device: {device}")
 
     # make seed visible to worker processes
     global GLOBAL_SEED
@@ -97,8 +98,8 @@ def main():
 
     
     # datasets
-    trainset = datasets.CIFAR100(root="./data", train=True, download=False, transform=tf_train)
-    testset  = datasets.CIFAR100(root="./data", train=False, download=False, transform=tf_test)
+    trainset = datasets.CIFAR100(root="./data", train=True, download=True, transform=tf_train)
+    testset  = datasets.CIFAR100(root="./data", train=False, download=True, transform=tf_test)
     test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=0)
 
     # non-IID client splits
@@ -117,6 +118,9 @@ def main():
         opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
         replay = ReplayBuffer(capacity=2000)
         clients.append(Client(cid, model, opt, loader, device=device, replay=replay))
+
+    # ✅ Check device
+    print("✅ Client 0 model device:", next(clients[0].model.parameters()).device)
 
     server = Server(device=device)
     policy = Policy()
