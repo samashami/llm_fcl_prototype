@@ -50,7 +50,7 @@ class Client:
 
             # optional replay: sample on CPU, then move to device
             if self.replay is not None and replay_ratio > 0.0:
-                rx, ry = self.replay.sample_like(x.size(0), ratio=replay_ratio)
+                rx, ry = self.replay.sample_like(x.size(0), device=self.device, ratio=replay_ratio)
                 if rx is not None:
                     rx = rx.to(self.device, non_blocking=True)
                     ry = ry.to(self.device, non_blocking=True)
