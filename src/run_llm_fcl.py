@@ -158,6 +158,12 @@ def main():
         replay = ReplayBuffer(capacity=2000)
         clients.append(Client(cid, model, opt, loader, device=device, replay=replay))
 
+         ####### for testing: count params
+        if cid == 0:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            print(f"Trainable params: {trainable}/{total}")
+
     # ✅ Check device
     print("✅ Client 0 model device:", next(clients[0].model.parameters()).device)
 
