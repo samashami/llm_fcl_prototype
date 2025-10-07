@@ -162,6 +162,61 @@ def main():
     print("✅ Client 0 model device:", next(clients[0].model.parameters()).device)
 
 
+    # --- server, policy, and initial eval ---
+    server = Server(device=device)
+    policy = Policy()
+    best_recall = np.zeros(100, dtype=np.float32)
+    last_acc = None
+
+    # initial global model (FedAvg of untrained client models)
+    global_model = server.average([c.model for c in clients])
+    acc, per_class = evaluate(global_model, device, test_loader)
+    forgetting = np.maximum(0.0, best_recall - per_class)
+    best_recall = np.maximum(best_recall, per_class)
+    print(f"[Round -1] acc={acc:.3f}", flush=True)
+
+    # --- training rounds ---
+    for r in range(args.rounds):
+        acc_delta = 0.0 if last_acc is None else (acc - last_acc)
+        if args.use_policy:
+            summary = {
+                "round": r,
+                "accuracy_global": float(acc),
+                "acc_delta": float(acc_delta),
+                "forgetting_per_class": [float(x) for x in forgetting],
+                "non_iid_alpha": float(args.alpha),
+            }
+            hp = policy.decide(summary)
+        else:
+            hp = {"lr": args.lr, "replay_ratio": 0.20, "notes": "fixed (baseline)"}
+        print(f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} -> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})", flush=True)
+
+        # broadcast global + set lr
+        for c in clients:
+            c.load_state_from(global_model)
+            for pg in c.optimizer.param_groups:
+                pg["lr"] = hp["lr"]
+
+        # local training
+        for c in clients:
+            print(f"[Round {r}] training client {c.cid} on {next(c.model.parameters()).device}", flush=True)
+            for e in range(args.epochs):
+                c.train_one_epoch(
+                    replay_ratio=hp["replay_ratio"],
+                    epoch=e,
+                    total_epochs=args.epochs,
+                    log_interval=args.log_interval,
+                )
+
+        # aggregate & eval
+        global_model = server.average([c.model for c in clients])
+        last_acc = acc
+        acc, per_class = evaluate(global_model, device, test_loader)
+        forgetting = np.maximum(0.0, best_recall - per_class)
+        best_recall = np.maximum(best_recall, per_class)
+        print(f"[Round {r}] acc={acc:.3f}", flush=True)
+
+
 
 if __name__ == "__main__":
     main()
