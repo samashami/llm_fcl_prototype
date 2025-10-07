@@ -162,10 +162,10 @@ def main():
         if cid == 0:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in model.parameters())
-            print(f"Trainable params: {trainable}/{total}")
+            print(f"Trainable params: {trainable}/{total}", flush=True)
 
     # ✅ Check device
-    print("✅ Client 0 model device:", next(clients[0].model.parameters()).device)
+    print("✅ Client 0 model device:", next(clients[0].model.parameters()).device, flush=True)
 
 
     # --- server, policy, and initial eval ---
