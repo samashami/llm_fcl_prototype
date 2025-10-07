@@ -160,3 +160,8 @@ def main():
 
     # ✅ Check device
     print("✅ Client 0 model device:", next(clients[0].model.parameters()).device)
+
+
+
+if __name__ == "__main__":
+    main()
