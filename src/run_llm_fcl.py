@@ -56,7 +56,7 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.2)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--rounds", type=int, default=2)
-    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--subset_per_client", type=int, default=4000, help="for fast CPU demo; use -1 for all")
     ap.add_argument("--use_policy", action="store_true", help="enable LLM-like policy controller")
@@ -66,6 +66,10 @@ def main():
     ap.add_argument("--split_mode", choices=["equal", "dirichlet"], default="equal",
                 help="equal: equal-size random split per client; dirichlet: non-iid alpha")
     ap.add_argument("--val_size", type=int, default=5000, help="validation holdout from CIFAR100 train")
+    ap.add_argument("--cl_batches", type=int, default=7, help="number of continual-learning batches per client")
+    ap.add_argument("--num_workers", type=int, default=4, help="DataLoader workers (paper: 4)")
+    ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam",
+                help="Paper fine-tuning used Adam; switch to sgd if you want FedSGD baseline.")
 
     args = ap.parse_args()
     set_seeds(args.seed)
@@ -121,8 +125,7 @@ def main():
 
     # loaders for val/test (val not yet used; will be in early stopping step)
     valset = Subset(trainset_full, val_indices)
-    test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
-
+    test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     print(f"[Split] train={len(train_indices)} val={len(val_indices)} test={len(testset)}", flush=True)
 
     # --- client splits (equal-size, random) ---
@@ -147,14 +150,53 @@ def main():
     for i, idxs in enumerate(splits):
         print(f"[Split] client {i}: {len(idxs)} images", flush=True)
 
+    # === Build CL schedule: 1 initial batch + (cl_batches-1) increments ===
+    def make_cl_batches(indices, num_batches=7, seed=42):
+        rng = np.random.RandomState(seed)
+        idx = np.array(indices, dtype=np.int64)
+        rng.shuffle(idx)
+
+        # initial batch ~ 0.466 of data (e.g., 5250/11250 in your example)
+        init = int(round(0.466 * len(idx)))
+        init = max(1, min(len(idx) - (num_batches - 1), init))  # keep space for the increments
+
+        first = idx[:init]
+        rem = idx[init:]
+
+        # split remaining evenly over (num_batches - 1)
+        if num_batches <= 1:
+            return [idx.tolist()]
+
+        per = len(rem) // (num_batches - 1)
+        chunks = [rem[i*per:(i+1)*per] for i in range(num_batches - 2)]
+        chunks.append(rem[(num_batches - 2)*per:])  # last chunk gets the remainder
+
+        batches = [first] + chunks
+        return [b.tolist() for b in batches]
+
+    # Build a per-client list of batches
+    cl_schedule = []
+    for cid, idxs in enumerate(splits):
+        batches = make_cl_batches(idxs, num_batches=args.cl_batches, seed=args.seed + cid)
+        cl_schedule.append(batches)
+        sizes = [len(b) for b in batches]
+        print(f"[CL] client {cid}: {sizes} (sum={sum(sizes)})", flush=True)
+
+    # Optional: align rounds to cl_batches if you want one CL batch per FL round
+    if args.rounds != args.cl_batches:
+        print(f"[Note] args.rounds ({args.rounds}) != cl_batches ({args.cl_batches}). "
+            f"If you want 1 batch per round, set --rounds {args.cl_batches}.", flush=True)
+
     # --- init clients ---
     # init clients
     clients = []
     for cid, idx in enumerate(splits):
         subset = Subset(trainset_full, idx)  # note: from *full* train with tf_train
-        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
-        model = build_resnet18(100).to(device)
-        opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)        model = build_resnet18(100).to(device)
+        if args.optimizer == "adam":
+            opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
+        else:
+            opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
         replay = ReplayBuffer(capacity=2000)
         clients.append(Client(cid, model, opt, loader, device=device, replay=replay))
 
@@ -181,7 +223,7 @@ def main():
     best_recall = np.maximum(best_recall, per_class)
     print(f"[Round -1] acc={acc:.3f}", flush=True)
 
-    # --- training rounds ---
+        # --- training rounds ---
     for r in range(args.rounds):
         acc_delta = 0.0 if last_acc is None else (acc - last_acc)
         if args.use_policy:
@@ -194,8 +236,11 @@ def main():
             }
             hp = policy.decide(summary)
         else:
-            hp = {"lr": args.lr, "replay_ratio": 0.20, "notes": "fixed (baseline)"}
-        print(f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} -> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})", flush=True)
+            hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
+
+        print(f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} "
+            f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
+            flush=True)
 
         # broadcast global + set lr
         for c in clients:
@@ -203,9 +248,31 @@ def main():
             for pg in c.optimizer.param_groups:
                 pg["lr"] = hp["lr"]
 
-        # local training
+        # --- local continual-learning training ---
         for c in clients:
-            print(f"[Round {r}] training client {c.cid} on {next(c.model.parameters()).device}", flush=True)
+            # Select the current CL batch for this round
+            batches = cl_schedule[c.cid]
+            if r < len(batches):
+                batch_indices = batches[r]
+                batch_id = r
+            else:
+                batch_indices = batches[-1]
+                batch_id = len(batches) - 1
+
+            # Assign new dataloader for this CL batch (incremental data)
+            c.loader = DataLoader(
+                Subset(trainset_full, batch_indices),
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
+
+            print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
+                f"(new={len(batch_indices)}; replay ratio≈{hp['replay_ratio']:.2f})",
+                flush=True)
+
+            # Train for several epochs, mixing replay from previous batches
             for e in range(args.epochs):
                 c.train_one_epoch(
                     replay_ratio=hp["replay_ratio"],
@@ -214,7 +281,7 @@ def main():
                     log_interval=args.log_interval,
                 )
 
-        # aggregate & eval
+        # --- aggregate & evaluate global model ---
         global_model = server.average([c.model for c in clients])
         last_acc = acc
         acc, per_class = evaluate(global_model, device, test_loader)
