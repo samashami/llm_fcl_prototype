@@ -192,7 +192,9 @@ def main():
     clients = []
     for cid, idx in enumerate(splits):
         subset = Subset(trainset_full, idx)  # note: from *full* train with tf_train
-        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)        model = build_resnet18(100).to(device)
+        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+        
+        model = build_resnet18(100).to(device)
         if args.optimizer == "adam":
             opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
         else:
