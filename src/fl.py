@@ -45,6 +45,9 @@ class Client:
         num_batches = len(self.loader)
         running_loss = 0.0
 
+        correct = 0
+        total = 0
+        
         for b, (x, y) in enumerate(self.loader, 1):
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
@@ -65,6 +68,16 @@ class Client:
 
             running_loss += float(loss.item())
 
+            # ➕ accuracy (on the *mixed* batch if replay is used)
+            with torch.no_grad():
+                preds = logits.argmax(dim=1)
+                batch_correct = (preds == y).sum().item()
+                batch_total = y.size(0)
+                batch_acc = 100.0 * batch_correct / batch_total
+                correct += batch_correct
+                total += batch_total
+                epoch_acc_so_far = 100.0 * correct / max(1, total)
+
             # store *CPU* copies to avoid VRAM growth
             if self.replay is not None:
                 self.replay.add_batch(x.detach().cpu(), y.detach().cpu())
@@ -78,8 +91,11 @@ class Client:
                 )
 
         avg_loss = running_loss / max(1, num_batches)
+        # ➕ final epoch accuracy
+        avg_acc = 100.0 * correct / max(1, total)
         print(
-            f"[Client {self.cid}] epoch {epoch+1}/{total_epochs} done, avg_loss={avg_loss:.4f}",
+            f"[Client {self.cid}] epoch {epoch+1}/{total_epochs} done, "
+            f"avg_loss={avg_loss:.4f}, epoch_acc={avg_acc:.2f}%",
             flush=True,
         )
         return avg_loss
