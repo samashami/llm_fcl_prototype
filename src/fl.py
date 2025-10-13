@@ -20,19 +20,44 @@ class Server:
 
 class Client:
     def __init__(self, cid: int, model: nn.Module, optimizer, train_loader,
-                 device: Optional[torch.device] = None, replay: Optional[ReplayBuffer] = None):
+                 device: Optional[torch.device] = None, replay: Optional[ReplayBuffer] = None,
+                 val_loader: Optional[torch.utils.data.DataLoader] = None,
+                 early_patience: int = 5):
         self.cid = cid
         self.device = device or torch.device("cpu")
-        self.model = model.to(self.device)                     # ⬅ ensure model on device
+        self.model = model.to(self.device)                    
         self.optimizer = optimizer
         self.criterion = nn.CrossEntropyLoss()
         self.loader = train_loader
         self.replay = replay or ReplayBuffer(capacity=2000)
+        self.val_loader = val_loader
+        self.early_patience = early_patience
+        self._best_val = None
+        self._no_improve = 0
+
 
     def load_state_from(self, global_model: nn.Module):
         # load weights then keep model on device
         self.model.load_state_dict(global_model.state_dict())
-        self.model.to(self.device)                             # ⬅ keep on device
+        self.model.to(self.device)    
+        self._best_val = None
+        self._no_improve = 0  
+
+    @torch.no_grad()
+    def evaluate(self, loader):
+        self.model.eval()
+        total, correct, loss_sum = 0, 0, 0.0
+        for x, y in loader:
+            x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            logits = self.model(x)
+            loss = self.criterion(logits, y)
+            loss_sum += float(loss.item())
+            pred = logits.argmax(1)
+            total += y.numel()
+            correct += (pred == y).sum().item()
+        avg_loss = loss_sum / max(1, len(loader))
+        acc = 100.0 * correct / max(1, total)
+        return avg_loss, acc                      
 
     def train_one_epoch(
         self,
@@ -44,14 +69,13 @@ class Client:
         self.model.train()
         num_batches = len(self.loader)
         running_loss = 0.0
-
         correct = 0
         total = 0
-        
+
         for b, (x, y) in enumerate(self.loader, 1):
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-            # optional replay: sample on CPU, then move to device
+            # optional replay
             if self.replay is not None and replay_ratio > 0.0:
                 rx, ry = self.replay.sample_like(x.size(0), device=self.device, ratio=replay_ratio)
                 if rx is not None:
@@ -68,17 +92,15 @@ class Client:
 
             running_loss += float(loss.item())
 
-            # ➕ accuracy (on the *mixed* batch if replay is used)
+            # accuracy on current (possibly replay-mixed) batch
             with torch.no_grad():
                 preds = logits.argmax(dim=1)
                 batch_correct = (preds == y).sum().item()
                 batch_total = y.size(0)
-                batch_acc = 100.0 * batch_correct / batch_total
                 correct += batch_correct
                 total += batch_total
-                epoch_acc_so_far = 100.0 * correct / max(1, total)
 
-            # store *CPU* copies to avoid VRAM growth
+            # store CPU copies for replay
             if self.replay is not None:
                 self.replay.add_batch(x.detach().cpu(), y.detach().cpu())
 
@@ -91,11 +113,25 @@ class Client:
                 )
 
         avg_loss = running_loss / max(1, num_batches)
-        # ➕ final epoch accuracy
-        avg_acc = 100.0 * correct / max(1, total)
+        epoch_acc = 100.0 * correct / max(1, total)
+
+        # --- Validation + early stopping ---
+        val_note = ""
+        if self.val_loader is not None:
+            vloss, vacc = self.evaluate(self.val_loader)
+            val_note = f", val_loss={vloss:.4f}, val_acc={vacc:.2f}%"
+            improved = (self._best_val is None) or (vacc > self._best_val + 1e-4)
+            if improved:
+                self._best_val = vacc
+                self._no_improve = 0
+            else:
+                self._no_improve += 1
+
         print(
             f"[Client {self.cid}] epoch {epoch+1}/{total_epochs} done, "
-            f"avg_loss={avg_loss:.4f}, epoch_acc={avg_acc:.2f}%",
+            f"avg_loss={avg_loss:.4f}, epoch_acc={epoch_acc:.2f}%{val_note}",
             flush=True,
         )
-        return avg_loss
+
+        should_stop = (self.val_loader is not None) and (self._no_improve >= self.early_patience)
+        return avg_loss, epoch_acc, should_stop

@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--num_workers", type=int, default=4, help="DataLoader workers (paper: 4)")
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam",
                 help="Paper fine-tuning used Adam; switch to sgd if you want FedSGD baseline.")
+    ap.add_argument("--early_patience", type=int, default=5)
 
     args = ap.parse_args()
     set_seeds(args.seed)
@@ -125,6 +126,7 @@ def main():
 
     # loaders for val/test (val not yet used; will be in early stopping step)
     valset = Subset(trainset_full, val_indices)
+    val_loader = DataLoader(valset, batch_size=256, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     test_loader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     print(f"[Split] train={len(train_indices)} val={len(val_indices)} test={len(testset)}", flush=True)
 
@@ -200,7 +202,9 @@ def main():
         else:
             opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
         replay = ReplayBuffer(capacity=2000)
-        clients.append(Client(cid, model, opt, loader, device=device, replay=replay))
+        clients.append(Client(cid, model, opt, loader, device=device, replay=replay,
+        val_loader=val_loader, early_patience=args.early_patience))
+        
 
          ####### for testing: count params
         if cid == 0:
@@ -275,13 +279,21 @@ def main():
                 flush=True)
 
             # Train for several epochs, mixing replay from previous batches
-            for e in range(args.epochs):
-                c.train_one_epoch(
+            for e in range(args.epochs):     
+                avg_loss, epoch_acc, stop = c.train_one_epoch(
                     replay_ratio=hp["replay_ratio"],
                     epoch=e,
                     total_epochs=args.epochs,
                     log_interval=args.log_interval,
                 )
+
+                if stop:
+                    print(
+                        f"[Client {c.cid}] Early stopping triggered "
+                        f"(no val improvement {c.early_patience} epochs).",
+                        flush=True,
+                    )
+                    break
 
         # --- aggregate & evaluate global model ---
         global_model = server.average([c.model for c in clients])
