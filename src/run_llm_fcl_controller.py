@@ -251,7 +251,7 @@ def main():
     best_recall = np.maximum(best_recall, per_class)
     print(f"[Round -1] acc={acc:.3f}", flush=True)
 
-        # --- training rounds ---
+    # --- training rounds ---
     for r in range(args.rounds):
         acc_delta = 0.0 if last_acc is None else (acc - last_acc)
         if args.use_policy:
@@ -262,7 +262,17 @@ def main():
                 "forgetting_per_class": [float(x) for x in forgetting],
                 "non_iid_alpha": float(args.alpha),
             }
-            hp = policy.decide(summary)
+            if r == 0:
+                # ✅ Safe warm-up: start exactly like the paper baseline
+                hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "warmup (paper defaults)"}
+            else:
+                hp = policy.decide(summary)
+                # ✅ Clamp policy outputs to safe ranges
+                lr_min, lr_max = 5e-5, 5e-4        # (0.5× to 5× paper LR)
+                rep_min, rep_max = 0.30, 0.70      # keep replay meaningful
+                hp["lr"] = float(min(max(hp.get("lr", args.lr), lr_min), lr_max))
+                hp["replay_ratio"] = float(min(max(hp.get("replay_ratio", 0.50), rep_min), rep_max))
+                hp["notes"] = f"policy (clamped to lr∈[{lr_min},{lr_max}], replay∈[{rep_min},{rep_max}])"
         else:
             hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
 
