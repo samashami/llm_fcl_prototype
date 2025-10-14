@@ -7,6 +7,8 @@ from torchvision import datasets, transforms
 from torchvision.models import ResNet18_Weights
 import random
 import csv, os
+import pandas as pd
+import time
 
 from src.model import build_resnet18
 from src.fl import Client, Server
@@ -71,6 +73,9 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam",
                 help="Paper fine-tuning used Adam; switch to sgd if you want FedSGD baseline.")
     ap.add_argument("--early_patience", type=int, default=5)
+    ap.add_argument("--tag", type=str, default="baseline",
+                help="label for this run (used in CSV filenames)")
+    
 
     args = ap.parse_args()
     set_seeds(args.seed)
@@ -172,9 +177,8 @@ def main():
         per = len(rem) // (num_batches - 1)
         chunks = [rem[i*per:(i+1)*per] for i in range(num_batches - 2)]
         chunks.append(rem[(num_batches - 2)*per:])  # last chunk gets the remainder
+        return [first.tolist()] + [c.tolist() for c in chunks]
 
-        batches = [first] + chunks
-        return [b.tolist() for b in batches]
 
     # Build a per-client list of batches
     cl_schedule = []
@@ -183,6 +187,23 @@ def main():
         cl_schedule.append(batches)
         sizes = [len(b) for b in batches]
         print(f"[CL] client {cid}: {sizes} (sum={sum(sizes)})", flush=True)
+
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_logs = []       # per-epoch logs
+    round_logs = []     # per-round global acc
+
+    # store CL schedule for export
+    cl_rows = []
+    for cid, batches in enumerate(cl_schedule):
+        for i, b in enumerate(batches, start=1):
+            cl_rows.append({
+                "run_id": run_id,
+                "client": cid,
+                "cl_batch": i,
+                "size": len(b)
+            })
+    
+
 
     # Optional: align rounds to cl_batches if you want one CL batch per FL round
     if args.rounds != args.cl_batches:
@@ -286,6 +307,22 @@ def main():
                     total_epochs=args.epochs,
                     log_interval=args.log_interval,
                 )
+                # per-epoch log row
+                run_logs.append({
+                    "run_id": run_id,
+                    "tag": getattr(args, "tag", "controller"),
+                    "round": r,
+                    "client": c.cid,
+                    "epoch": e + 1,
+                    "lr": hp["lr"],
+                    "replay_ratio": hp["replay_ratio"],
+                    "cl_batch": batch_id + 1,
+                    "cl_batch_size": len(batch_indices),
+                    "train_loss": float(avg_loss),
+                    "train_acc": float(epoch_acc),
+                    "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
+                    "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
+                })
 
                 if stop:
                     print(
@@ -295,15 +332,32 @@ def main():
                     )
                     break
 
+
         # --- aggregate & evaluate global model ---
         global_model = server.average([c.model for c in clients])
         last_acc = acc
         acc, per_class = evaluate(global_model, device, test_loader)
+        round_logs.append({
+            "run_id": run_id,
+            "tag": getattr(args, "tag", "controller"),
+            "round": r,
+            "global_acc": float(acc),
+            "lr": hp["lr"],
+            "replay_ratio": hp["replay_ratio"],
+        })
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
         print(f"[Round {r}] acc={acc:.3f}", flush=True)
 
-
+    # === write CSVs ===
+    pd.DataFrame(run_logs).to_csv(f"fcl_run_results_controller_{run_id}.csv", index=False)
+    pd.DataFrame(round_logs).to_csv(f"fcl_run_summary_controller_{run_id}.csv", index=False)
+    pd.DataFrame(cl_rows).to_csv(f"fcl_run_cl_batches_controller_{run_id}.csv", index=False)
+    print("✓ Wrote CSVs:",
+        f"fcl_run_results_controller_{run_id}.csv,",
+        f"fcl_run_summary_controller_{run_id}.csv,",
+        f"fcl_run_cl_batches_controller_{run_id}.csv")
 
 if __name__ == "__main__":
+
     main()
