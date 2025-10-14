@@ -119,6 +119,8 @@ class Client:
         val_note = ""
         if self.val_loader is not None:
             vloss, vacc = self.evaluate(self.val_loader)
+            self._last_vloss = vloss
+            self._last_vacc  = vacc
             val_note = f", val_loss={vloss:.4f}, val_acc={vacc:.2f}%"
             improved = (self._best_val is None) or (vacc > self._best_val + 1e-4)
             if improved:
