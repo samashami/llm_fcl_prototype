@@ -267,9 +267,9 @@ def main():
                 hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "warmup (paper defaults)"}
             else:
                 hp = policy.decide(summary)
-                # ✅ Clamp policy outputs to safe ranges
-                lr_min, lr_max = 5e-5, 5e-4        # (0.5× to 5× paper LR)
-                rep_min, rep_max = 0.30, 0.70      # keep replay meaningful
+                # ✅ Clamp policy outputs to new ranges
+                lr_min, lr_max = 1e-4, 1e-3        # allow more aggressive LR exploration
+                rep_min, rep_max = 0.20, 0.70      # allow lower replay if policy wants it
                 hp["lr"] = float(min(max(hp.get("lr", args.lr), lr_min), lr_max))
                 hp["replay_ratio"] = float(min(max(hp.get("replay_ratio", 0.50), rep_min), rep_max))
                 hp["notes"] = f"policy (clamped to lr∈[{lr_min},{lr_max}], replay∈[{rep_min},{rep_max}])"
