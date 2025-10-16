@@ -10,6 +10,14 @@ import csv, os
 import pandas as pd
 import time
 
+# --- Controller v3 bounds & thresholds ---
+V3_LR_MIN, V3_LR_MAX = 1e-4, 1e-3       # widen LR room vs baseline
+V3_REP_MIN, V3_REP_MAX = 0.20, 0.70     # replay kept meaningful
+V3_DEADBAND = 0.003                     # |Δacc| below this = hold params
+V3_BOOST = 1.25                         # when acc improving, scale LR up
+V3_COOLDOWN = 1.5                       # when regressing, scale LR down
+V3_REP_STEP = 0.10                      # replay step when stabilizing/recovering
+
 from src.model import build_resnet18
 from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
@@ -216,7 +224,8 @@ def main():
     clients = []
     for cid, idx in enumerate(splits):
         subset = Subset(trainset_full, idx)  # note: from *full* train with tf_train
-        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+        loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+                             pin_memory=True, worker_init_fn=seed_worker, generator=g,)
         
         model = build_resnet18(100).to(device)
         if args.optimizer == "adam":
@@ -251,9 +260,13 @@ def main():
     best_recall = np.maximum(best_recall, per_class)
     print(f"[Round -1] acc={acc:.3f}", flush=True)
 
+    # v3: remember last hyperparams for deadband
+    last_hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "init"}
+
     # --- training rounds ---
     for r in range(args.rounds):
         acc_delta = 0.0 if last_acc is None else (acc - last_acc)
+
         if args.use_policy:
             summary = {
                 "round": r,
@@ -262,23 +275,68 @@ def main():
                 "forgetting_per_class": [float(x) for x in forgetting],
                 "non_iid_alpha": float(args.alpha),
             }
+
             if r == 0:
-                # ✅ Safe warm-up: start exactly like the paper baseline
+                # v3 warm-up = exact paper defaults (same as v2 warm-up)
                 hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "warmup (paper defaults)"}
+
             else:
+                # -------------------------------
+                # v2 (disabled): plain policy + clamp
+                # -------------------------------
+                """
+                # v2: keep this for reference
                 hp = policy.decide(summary)
-                # ✅ Clamp policy outputs to new ranges
-                lr_min, lr_max = 1e-4, 1e-3        # allow more aggressive LR exploration
-                rep_min, rep_max = 0.20, 0.70      # allow lower replay if policy wants it
+                lr_min, lr_max = 1e-4, 1e-3      # <- v2 clamp
+                rep_min, rep_max = 0.20, 0.70
                 hp["lr"] = float(min(max(hp.get("lr", args.lr), lr_min), lr_max))
                 hp["replay_ratio"] = float(min(max(hp.get("replay_ratio", 0.50), rep_min), rep_max))
                 hp["notes"] = f"policy (clamped to lr∈[{lr_min},{lr_max}], replay∈[{rep_min},{rep_max}])"
+                """
+
+                # -------------------------------
+                # v3 (active): policy + deadband + boost/recover + clamp
+                # -------------------------------
+                hp = policy.decide(summary)
+                lr = float(hp.get("lr", last_hp["lr"]))
+                rep = float(hp.get("replay_ratio", last_hp["replay_ratio"]))
+                notes = ["policy"]
+
+                # deadband: hold params if tiny change
+                if abs(acc_delta) < V3_DEADBAND:
+                    lr, rep = last_hp["lr"], last_hp["replay_ratio"]
+                    notes.append(f"deadband(|Δacc|<{V3_DEADBAND})")
+
+                # recovery: accuracy dropped
+                elif acc_delta < -V3_DEADBAND:
+                    lr = lr / V3_COOLDOWN
+                    rep = rep + V3_REP_STEP
+                    notes.append("recover(Δacc<0)")
+
+                # boost: accuracy improving
+                elif acc_delta > V3_DEADBAND:
+                    lr = lr * V3_BOOST
+                    rep = rep + (V3_REP_STEP / 2.0)
+                    notes.append("boost(Δacc>0)")
+
+                # clamp to v3 ranges
+                lr = max(V3_LR_MIN, min(V3_LR_MAX, lr))
+                rep = max(V3_REP_MIN, min(V3_REP_MAX, rep))
+                notes.append(f"clamped(lr∈[{V3_LR_MIN},{V3_LR_MAX}], rep∈[{V3_REP_MIN},{V3_REP_MAX}])")
+
+                hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
+
         else:
             hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
 
-        print(f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} "
+        print(
+            f"[Policy r={r}] acc={acc:.3f} Δ={acc_delta:+.3f} "
             f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
-            flush=True)
+            flush=True,
+        )
+
+        # v3: remember chosen hp (used by deadband/boost/recover next round)
+        last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
 
         # broadcast global + set lr
         for c in clients:
@@ -303,7 +361,8 @@ def main():
                 batch_size=args.batch_size,
                 shuffle=True,
                 num_workers=args.num_workers,
-                pin_memory=True,
+                pin_memory=True, worker_init_fn=seed_worker,
+                generator=g,
             )
 
             print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
@@ -355,6 +414,7 @@ def main():
             "global_acc": float(acc),
             "lr": hp["lr"],
             "replay_ratio": hp["replay_ratio"],
+            "notes": hp.get("notes", ""),
         })
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
