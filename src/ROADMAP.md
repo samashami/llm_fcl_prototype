@@ -92,13 +92,7 @@ Hard bounds enforced & clamped (safety guarantee).
 ```
 </pre>
 
-Global bounds (locked for CIFAR & DWRL)
-	•	Base LR: [1e-4, 2e-3] (default 1e-4).
-	•	Per-client LR scale: [0.80, 1.20].
-	•	Replay ratio: [0.20, 0.70].
-	•	EWC λ: [0.0, 1000.0] (can remain 0 until you enable EWC loss).
-	•	Client selection K: [2, 4] (use 4 for apples-to-apples; vary in ablations).
-	•	Aggregation: start with FedAvg; later allow FedProx with μ [0.0, 0.1] (only when enabled).
+All parameter ranges and defaults follow the Global Invariants table at the end of this document.
 
 1.3 Reward (compute & log now; used for RL later)
 	•	AULC: running mean of acc_global up to round t. (Primary gain term.)
