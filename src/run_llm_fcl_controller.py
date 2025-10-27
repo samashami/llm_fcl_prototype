@@ -12,6 +12,8 @@ from src.model import build_resnet18
 from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
+from src.agent_io import save_json, validate_and_clamp_action
+import os, json
 
 # ---------------------------
 # Controller v4 hyperparams
@@ -260,6 +262,24 @@ def main():
 
     run_logs, round_logs = [], []
 
+    io_root = os.path.join("runs", run_id)
+    os.makedirs(io_root, exist_ok=True)
+
+    def _build_state(round_id, acc_global, loss_global, ema_loss, forget_mean, forget_max, divergence, bytes_last_round, client_snapshots):
+        return {
+            "round_id": int(round_id),
+            "global": {
+                "acc": float(acc_global),
+                "loss": float(loss_global),
+                "ema_loss": float(ema_loss),
+                "forget_mean": float(forget_mean),
+                "forget_max": float(forget_max),
+                "divergence": float(divergence),
+                "bytes_last_round": int(bytes_last_round),
+            },
+            "clients": client_snapshots,  # list of dicts with vloss, vacc, last_lr, last_replay_ratio, last_ewc_lambda, etc.
+        }
+
     # ---------------------------
     # Training rounds
     # ---------------------------
@@ -439,6 +459,52 @@ def main():
         ema_loss = V4_EMA_ALPHA * global_loss + (1.0 - V4_EMA_ALPHA) * ema_loss
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
+
+        # --- build per-client snapshot (minimal fields for now) ---
+        client_snaps = []
+        for c in clients:
+            client_snaps.append({
+                "id": c.cid,
+                "vloss": float(getattr(c, "_last_vloss", float("nan"))),
+                "vacc": float(getattr(c, "_last_vacc", float("nan"))),
+                "new_batch_size": int(getattr(c, "loader", None).dataset.__len__() if getattr(c, "loader", None) else 0),
+                "replay_capacity": int(getattr(c.replay, "capacity", 2000)),
+                "last_lr": float(c.optimizer.param_groups[0]["lr"]),
+                "last_replay_ratio": float(hp.get("replay_ratio", 0.50)),
+                "last_ewc_lambda": float(0.0),  # placeholder until EWC is wired
+            })
+
+        # --- estimate bytes moved last round (up+down) ---
+        model_size_bytes = sum(p.numel() for p in global_model.parameters()) * 4  # float32
+        bytes_last_round = model_size_bytes * 2 * len(clients)  # up + down
+
+        # --- build and save STATE ---
+        round_dir = os.path.join(io_root, f"round_{r:02d}")
+        os.makedirs(round_dir, exist_ok=True)
+        state = _build_state(
+            round_id=r,
+            acc_global=acc,
+            loss_global=float(getattr(server, "_last_loss", float("nan"))),  # if you track it; else leave nan
+            ema_loss=float(getattr(server, "_ema_loss", float("nan"))),      # idem
+            forget_mean=float(np.mean(forgetting)),
+            forget_max=float(np.max(forgetting)),
+            divergence=float(getattr(server, "_last_divergence", 0.0)),      # if you compute it in v4; else 0.0
+            bytes_last_round=bytes_last_round,
+            client_snapshots=client_snaps,
+        )
+        save_json(state, os.path.join(round_dir, "state.json"))
+
+        # --- create a SAFE action (baseline defaults) and save it ---
+        baseline_action = {
+            "client_selection_k": len(clients),
+            "aggregation": {"method": "FedAvg"},
+            "client_params": [
+                {"id": c.cid, "replay_ratio": hp.get("replay_ratio", 0.50), "lr_scale": 1.00, "ewc_lambda": 0.0}
+                for c in clients
+            ],
+        }
+        safe_action = validate_and_clamp_action(baseline_action, n_clients=len(clients), policy_source="Baseline-Defaults")
+        save_json(safe_action, os.path.join(round_dir, "action.json"))
 
         round_logs.append({
             "run_id": run_id, "tag": args.tag, "round": r,
