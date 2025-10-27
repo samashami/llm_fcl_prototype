@@ -13,6 +13,7 @@ from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.agent_io import save_json, validate_and_clamp_action
+from src.agent_io import write_state_json, write_action_json, validate_action
 import os, json
 
 # ---------------------------
@@ -286,6 +287,37 @@ def main():
     for r in range(args.rounds):
         acc_delta = float(acc - last_acc)
 
+        # --- Build and write state JSON ---
+        client_snaps = []
+        for c in clients:
+            vloss = getattr(c, "_last_vloss", float("nan"))
+            vacc  = getattr(c, "_last_vacc", float("nan"))
+            client_snaps.append({
+                "id": int(c.cid),
+                "vloss": float(vloss),
+                "vacc": float(vacc),
+                "new_batch_size": int(len(cl_schedule[c.cid][r]) if r < len(cl_schedule[c.cid]) else len(cl_schedule[c.cid][-1])),
+                "replay_capacity": int(getattr(c, "replay_capacity", 2000)),
+                "last_lr": float(getattr(c.optimizer.param_groups[0], "get", lambda k, d=None: None)("lr") if hasattr(c, "optimizer") else hp["lr"] if 'hp' in locals() else args.lr),
+                "last_replay_ratio": float(last_hp["replay_ratio"] if 'last_hp' in locals() else 0.50),
+                "last_ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
+            })
+
+        state = {
+            "round_id": int(r),
+            "global": {
+                "acc": float(acc),
+                "loss": float(global_loss),
+                "ema_loss": float(ema_loss),
+                "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
+                "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
+                "divergence": float(div_norm),
+                "bytes_last_round": int(bytes_last_round if 'bytes_last_round' in locals() else 0),
+            },
+            "clients": client_snaps,
+        }
+        write_state_json(io_root, r, state)
+
         # ---- POLICY DECISION ----
         if args.use_policy:
             # rollback branch
@@ -365,6 +397,29 @@ def main():
             for pg in c.optimizer.param_groups:
                 pg["lr"] = hp["lr"] * float(scale)
             c._last_lr_scale = float(scale)
+
+            # ---- Log action decision for this round ----
+        action = {
+            "client_selection_k": len(clients),
+            "aggregation": {"method": "FedAvg"},
+            "client_params": [
+                {
+                    "id": int(c.cid),
+                    "replay_ratio": float(hp["replay_ratio"]),
+                    "lr_scale": float(getattr(c, "_last_lr_scale", 1.0)),
+                    "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
+                }
+                for c in clients
+            ],
+        }
+        action = validate_action(action, K=len(clients), policy_source="Mock")
+        write_action_json(io_root, r, action)
+
+    # ---- Local training per client ----
+    for c in clients:
+        batches = cl_schedule[c.cid]
+        if r < len(batches):
+            batch_indices = batches[r]
 
         # ---- Local training per client ----
         for c in clients:
