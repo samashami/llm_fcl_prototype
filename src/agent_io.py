@@ -5,7 +5,8 @@ Handles State/Action JSON I/O, schema validation, and safe clamping
 for controllers (Mock, Controller-v4, API, LLM, etc.).
 """
 
-import json, os
+import json
+import os
 from typing import Any, Dict, List, Optional
 
 # === Global safe bounds (matches ROADMAP) ===
@@ -98,27 +99,27 @@ def validate_and_clamp_action(
 
     return act
 
-
 # --- Public helpers used by the trainer ---
-
-def write_state_json(run_dir: str, round_id: int, state: dict) -> str:
+def write_state_json(run_dir: str, round_id: int, state: Dict[str, Any]) -> str:
     """Save the per-round State JSON to runs/<run_id>/state_round_<r>.json"""
     path = os.path.join(run_dir, f"state_round_{int(round_id)}.json")
-    save_json(state, path)
-    return path
+    return save_json(state, path)
 
-def write_action_json(run_dir: str, round_id: int, action: dict, policy_source: str = "Unknown") -> str:
+def write_action_json(run_dir: str, round_id: int, action: Dict[str, Any], policy_source: str = "Unknown") -> str:
     """Save the per-round Action JSON (with policy_source tag)"""
-    act = dict(action)
+    act = dict(action) if isinstance(action, dict) else {}
     act["policy_source"] = policy_source
     path = os.path.join(run_dir, f"action_round_{int(round_id)}.json")
-    save_json(act, path)
-    return path
+    return save_json(act, path)
 
-# keep this name for imports in the trainer
-def validate_action(action: dict, n_clients: int, policy_source: str = "Unknown") -> dict:
-    """Alias to the clamping validator so the trainer can import validate_action"""
-    return validate_and_clamp_action(action, n_clients=n_clients, policy_source=policy_source)
+def validate_action(action: Dict[str, Any], K: Optional[int] = None, n_clients: Optional[int] = None, policy_source: str = "Mock") -> Dict[str, Any]:
+    """
+    Wrapper to harmonize calls from the trainer:
+    - Accepts either K=... or n_clients=...
+    - Returns a fully validated & clamped action dict
+    """
+    n = int(n_clients or K or 4)
+    return validate_and_clamp_action(action, n_clients=n, policy_source=policy_source)
 
 # === Quick self-test ===
 if __name__ == "__main__":
@@ -129,6 +130,6 @@ if __name__ == "__main__":
             {"id": 0, "replay_ratio": 0.95, "lr_scale": 2.0, "ewc_lambda": -5}
         ],
     }
-    fixed = validate_and_clamp_action(bad_action, n_clients=4, policy_source="Mock")
+    fixed = validate_action(bad_action, K=4, policy_source="Mock")
     print("Original:", json.dumps(bad_action, indent=2))
     print("→ Clamped:", json.dumps(fixed, indent=2))
