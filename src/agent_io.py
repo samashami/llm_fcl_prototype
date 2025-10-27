@@ -98,35 +98,27 @@ def validate_and_clamp_action(
 
     return act
 
-# === Adapters expected by run_llm_fcl_controller ===
-def validate_action(action: Dict[str, Any], k_max: int) -> Dict[str, Any]:
-    """
-    Compatibility wrapper used by the training script.
-    k_max should be the number of available clients (or an upper bound).
-    """
-    return validate_and_clamp_action(action, n_clients=int(k_max), policy_source=None)
 
-def write_state_json(state: Dict[str, Any], run_dir: str, round_id: int) -> str:
-    """
-    Persist the controller State snapshot for round_id. Returns the written filepath.
-    """
+# --- Public helpers used by the trainer ---
+
+def write_state_json(run_dir: str, round_id: int, state: dict) -> str:
+    """Save the per-round State JSON to runs/<run_id>/state_round_<r>.json"""
     path = os.path.join(run_dir, f"state_round_{int(round_id)}.json")
-    return save_json(state, path)
+    save_json(state, path)
+    return path
 
-def write_action_json(
-    action: Dict[str, Any],
-    run_dir: str,
-    round_id: int,
-    policy_source: str = "Mock",
-) -> str:
-    """
-    Persist the Action with a policy_source tag. Returns the written filepath.
-    Assumes 'action' has already been validated/clamped; if not, upstream should call validate_action.
-    """
-    out = dict(action) if isinstance(action, dict) else {}
-    out["policy_source"] = policy_source
+def write_action_json(run_dir: str, round_id: int, action: dict, policy_source: str = "Unknown") -> str:
+    """Save the per-round Action JSON (with policy_source tag)"""
+    act = dict(action)
+    act["policy_source"] = policy_source
     path = os.path.join(run_dir, f"action_round_{int(round_id)}.json")
-    return save_json(out, path)
+    save_json(act, path)
+    return path
+
+# keep this name for imports in the trainer
+def validate_action(action: dict, n_clients: int, policy_source: str = "Unknown") -> dict:
+    """Alias to the clamping validator so the trainer can import validate_action"""
+    return validate_and_clamp_action(action, n_clients=n_clients, policy_source=policy_source)
 
 # === Quick self-test ===
 if __name__ == "__main__":
