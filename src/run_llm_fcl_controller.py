@@ -284,22 +284,31 @@ def main():
     # ---------------------------
     # Training rounds
     # ---------------------------
+    bytes_last_round = 0  # carried into the next round's state
     for r in range(args.rounds):
         acc_delta = float(acc - last_acc)
 
-        # --- Build and write state JSON ---
+        # --- Build and write state JSON (once, at round start) ---
         client_snaps = []
         for c in clients:
-            vloss = getattr(c, "_last_vloss", float("nan"))
-            vacc  = getattr(c, "_last_vacc", float("nan"))
+            # robust last_lr: if optimizer exists use it, else fallback to last chosen HP or CLI LR
+            if hasattr(c, "optimizer") and getattr(c.optimizer, "param_groups", None):
+                _lr = float(c.optimizer.param_groups[0]["lr"])
+            else:
+                _lr = float(last_hp.get("lr", args.lr))
+
+            # new batch size for THIS round for this client
+            batches = cl_schedule[c.cid]
+            nb = len(batches[r]) if r < len(batches) else len(batches[-1])
+
             client_snaps.append({
                 "id": int(c.cid),
-                "vloss": float(vloss),
-                "vacc": float(vacc),
-                "new_batch_size": int(len(cl_schedule[c.cid][r]) if r < len(cl_schedule[c.cid]) else len(cl_schedule[c.cid][-1])),
-                "replay_capacity": int(getattr(c, "replay_capacity", 2000)),
-                "last_lr": float(getattr(c.optimizer.param_groups[0], "get", lambda k, d=None: None)("lr") if hasattr(c, "optimizer") else hp["lr"] if 'hp' in locals() else args.lr),
-                "last_replay_ratio": float(last_hp["replay_ratio"] if 'last_hp' in locals() else 0.50),
+                "vloss": float(getattr(c, "_last_vloss", float("nan"))),
+                "vacc": float(getattr(c, "_last_vacc", float("nan"))),
+                "new_batch_size": int(nb),
+                "replay_capacity": int(getattr(getattr(c, "replay", None), "capacity", 2000)),
+                "last_lr": _lr,
+                "last_replay_ratio": float(last_hp.get("replay_ratio", 0.50)),
                 "last_ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
             })
 
@@ -312,13 +321,13 @@ def main():
                 "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
                 "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
                 "divergence": float(div_norm),
-                "bytes_last_round": int(bytes_last_round if 'bytes_last_round' in locals() else 0),
+                "bytes_last_round": int(bytes_last_round),
             },
             "clients": client_snaps,
         }
         write_state_json(io_root, r, state)
 
-        # ---- POLICY DECISION ----
+        # ---- POLICY DECISION (Controller v4) ----
         if args.use_policy:
             # rollback branch
             if rollback_flag:
@@ -381,7 +390,6 @@ def main():
         last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
 
         # ---- Broadcast global and set per-client LR scaling (inverted by loss rank) ----
-        # Gather last known client validation losses (fallback to global)
         vlosses = []
         for c in clients:
             v = getattr(c, "_last_vloss", None)
@@ -398,7 +406,7 @@ def main():
                 pg["lr"] = hp["lr"] * float(scale)
             c._last_lr_scale = float(scale)
 
-            # ---- Log action decision for this round ----
+        # ---- Save action JSON (once) ----
         action = {
             "client_selection_k": len(clients),
             "aggregation": {"method": "FedAvg"},
@@ -412,16 +420,10 @@ def main():
                 for c in clients
             ],
         }
-        action = validate_action(action, K=len(clients), policy_source="Mock")
+        action = validate_action(action, n_clients=len(clients), policy_source="Mock")
         write_action_json(io_root, r, action)
 
-    # ---- Local training per client ----
-    for c in clients:
-        batches = cl_schedule[c.cid]
-        if r < len(batches):
-            batch_indices = batches[r]
-
-        # ---- Local training per client ----
+        # ---- Local training per client (once) ----
         for c in clients:
             batches = cl_schedule[c.cid]
             if r < len(batches):
@@ -515,52 +517,11 @@ def main():
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
 
-        # --- build per-client snapshot (minimal fields for now) ---
-        client_snaps = []
-        for c in clients:
-            client_snaps.append({
-                "id": c.cid,
-                "vloss": float(getattr(c, "_last_vloss", float("nan"))),
-                "vacc": float(getattr(c, "_last_vacc", float("nan"))),
-                "new_batch_size": int(getattr(c, "loader", None).dataset.__len__() if getattr(c, "loader", None) else 0),
-                "replay_capacity": int(getattr(c.replay, "capacity", 2000)),
-                "last_lr": float(c.optimizer.param_groups[0]["lr"]),
-                "last_replay_ratio": float(hp.get("replay_ratio", 0.50)),
-                "last_ewc_lambda": float(0.0),  # placeholder until EWC is wired
-            })
-
-        # --- estimate bytes moved last round (up+down) ---
+        # ---- Comm bytes for this round (used next round) ----
         model_size_bytes = sum(p.numel() for p in global_model.parameters()) * 4  # float32
         bytes_last_round = model_size_bytes * 2 * len(clients)  # up + down
 
-        # --- build and save STATE ---
-        round_dir = os.path.join(io_root, f"round_{r:02d}")
-        os.makedirs(round_dir, exist_ok=True)
-        state = _build_state(
-            round_id=r,
-            acc_global=acc,
-            loss_global=float(getattr(server, "_last_loss", float("nan"))),  # if you track it; else leave nan
-            ema_loss=float(getattr(server, "_ema_loss", float("nan"))),      # idem
-            forget_mean=float(np.mean(forgetting)),
-            forget_max=float(np.max(forgetting)),
-            divergence=float(getattr(server, "_last_divergence", 0.0)),      # if you compute it in v4; else 0.0
-            bytes_last_round=bytes_last_round,
-            client_snapshots=client_snaps,
-        )
-        save_json(state, os.path.join(round_dir, "state.json"))
-
-        # --- create a SAFE action (baseline defaults) and save it ---
-        baseline_action = {
-            "client_selection_k": len(clients),
-            "aggregation": {"method": "FedAvg"},
-            "client_params": [
-                {"id": c.cid, "replay_ratio": hp.get("replay_ratio", 0.50), "lr_scale": 1.00, "ewc_lambda": 0.0}
-                for c in clients
-            ],
-        }
-        safe_action = validate_and_clamp_action(baseline_action, n_clients=len(clients), policy_source="Baseline-Defaults")
-        save_json(safe_action, os.path.join(round_dir, "action.json"))
-
+        # ---- Round summary log ----
         round_logs.append({
             "run_id": run_id, "tag": args.tag, "round": r,
             "global_acc": float(acc),
