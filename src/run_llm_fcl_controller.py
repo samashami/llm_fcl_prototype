@@ -341,7 +341,6 @@ def main():
         # --- optional: mock controller decides an action for this round ---
         if args.controller == "mock":
             mock_action = mock_decide_action(state, n_clients=len(clients))
-            write_action_json(io_root, r, mock_action, policy_source="Mock")
 
             # apply mock decision to this roundif args.controller == "v4":
             hp = {
@@ -437,7 +436,7 @@ def main():
                 pg["lr"] = hp["lr"] * float(scale)
             c._last_lr_scale = float(scale)
 
-        # ---- Save action JSON (once) ----
+        # --- build canonical Action from the chosen hp + client scales ---
         action = {
             "client_selection_k": len(clients),
             "aggregation": {"method": "FedAvg"},
@@ -451,8 +450,16 @@ def main():
                 for c in clients
             ],
         }
-        action = validate_action(action, n_clients=len(clients), policy_source="ControllerV4")
-        write_action_json(io_root, r, action, policy_source="ControllerV4")
+
+        # tag by controller type
+        source = (
+            "Mock" if args.controller == "mock"
+            else "ControllerV4" if args.controller == "v4"
+            else "Fixed"
+        )
+
+        action = validate_action(action, n_clients=len(clients), policy_source=source)
+        write_action_json(io_root, r, action, policy_source=source)
 
         # ---- Local training per client (once) ----
         for c in clients:
