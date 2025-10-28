@@ -444,7 +444,7 @@ def main():
                 for c in clients
             ],
         }
-        action = validate_action(action, n_clients=len(clients), policy_source="Mock")
+        action = validate_action(action, n_clients=len(clients), policy_source="ControllerV4")
         write_action_json(io_root, r, action, policy_source="ControllerV4")
 
         # ---- Local training per client (once) ----
