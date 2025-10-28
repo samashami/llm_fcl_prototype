@@ -327,7 +327,7 @@ def main():
             },
             "clients": client_snaps,
         }
-        write_state_json(io_root, r, state, policy_source="Mock")
+        write_state_json(io_root, r, state)
 
         # --- optional: mock controller decides an action for this round ---
         if args.controller == "mock":
