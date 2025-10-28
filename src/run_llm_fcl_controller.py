@@ -283,10 +283,18 @@ def main():
             "clients": client_snapshots,  # list of dicts with vloss, vacc, last_lr, last_replay_ratio, last_ewc_lambda, etc.
         }
 
+    def _safe_last_lr(c, fallback_lr):
+        try:
+            return float(c.optimizer.param_groups[0]["lr"])
+        except Exception:
+            return float(fallback_lr)
     # ---------------------------
     # Training rounds
     # ---------------------------
     bytes_last_round = 0  # carried into the next round's state
+    bytes_cum = 0
+    aulc_running = 0.0
+
     for r in range(args.rounds):
         acc_delta = float(acc - last_acc)
 
@@ -309,7 +317,7 @@ def main():
                 "vacc": float(getattr(c, "_last_vacc", float("nan"))),
                 "new_batch_size": int(nb),
                 "replay_capacity": int(getattr(getattr(c, "replay", None), "capacity", 2000)),
-                "last_lr": _lr,
+                "last_lr": _safe_last_lr(c, hp["lr"] if 'hp' in locals() else args.lr),
                 "last_replay_ratio": float(last_hp.get("replay_ratio", 0.50)),
                 "last_ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
             })
@@ -323,7 +331,8 @@ def main():
                 "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
                 "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
                 "divergence": float(div_norm),
-                "bytes_last_round": int(bytes_last_round),
+                "bytes_last_round": int(bytes_last_round if 'bytes_last_round' in locals() else 0),
+                "bytes_cum": int(bytes_cum),
             },
             "clients": client_snaps,
         }
@@ -336,7 +345,6 @@ def main():
             write_action_json(io_root, r, mock_action, policy_source="Mock")  # saves with policy_source
 
             # apply mock decision to this round's hp + per-client scales
-            # (keep v4 warmup/rollback outside; we override hp right here for mock)
             hp = {
                 "lr": float(args.lr),  # base lr stays same; we’ll scale per-client below
                 "replay_ratio": float(mock_action["client_params"][0]["replay_ratio"]) if mock_action["client_params"] else 0.50,
@@ -512,6 +520,8 @@ def main():
         global_model = server.average([c.model for c in clients])
         last_acc = float(acc)
         acc, per_class = evaluate(global_model, device, test_loader)
+        # running mean AULC up to round r
+        aulc_running = ((aulc_running * r) + float(acc)) / max(1, (r + 1))
 
         # ---- Rollback check ----
         if acc < best_global_acc - V4_ROLLBACK_THR:
@@ -544,6 +554,7 @@ def main():
         # ---- Comm bytes for this round (used next round) ----
         model_size_bytes = sum(p.numel() for p in global_model.parameters()) * 4  # float32
         bytes_last_round = model_size_bytes * 2 * len(clients)  # up + down
+        bytes_cum += int(bytes_last_round)
 
         # ---- Round summary log ----
         round_logs.append({
@@ -554,6 +565,8 @@ def main():
             "global_loss": float(global_loss), "ema_loss": float(ema_loss),
             "forget_mean": float(np.mean(forgetting)), "divergence": float(div_norm),
             "best_acc_so_far": float(best_global_acc), "was_rollback": bool(rollback_flag),
+            "comm_bytes_round": int(bytes_last_round),
+            "aulc_running": float(aulc_running),
         })
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
 
