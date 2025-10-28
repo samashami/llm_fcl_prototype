@@ -333,7 +333,7 @@ def main():
         if args.controller == "mock":
             # read the same in-memory 'state' we just wrote
             mock_action = mock_decide_action(state, n_clients=len(clients))
-            write_action_json(io_root, r, mock_action)  # saves with policy_source
+            write_action_json(io_root, r, mock_action, policy_source="Mock")  # saves with policy_source
 
             # apply mock decision to this round's hp + per-client scales
             # (keep v4 warmup/rollback outside; we override hp right here for mock)
@@ -445,7 +445,7 @@ def main():
             ],
         }
         action = validate_action(action, n_clients=len(clients), policy_source="Mock")
-        write_action_json(io_root, r, action)
+        write_action_json(io_root, r, action, policy_source="ControllerV4")
 
         # ---- Local training per client (once) ----
         for c in clients:
