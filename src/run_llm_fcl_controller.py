@@ -14,6 +14,7 @@ from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.agent_io import save_json, validate_and_clamp_action
 from src.agent_io import write_state_json, write_action_json, validate_action
+from src.mock_agent import decide_action as mock_decide_action
 import os, json
 
 # ---------------------------
@@ -112,6 +113,7 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
+    ap.add_argument("--controller", choices=["v4", "mock", "fixed"], default="v4")
     args = ap.parse_args()
 
     set_seeds(args.seed)
@@ -326,6 +328,28 @@ def main():
             "clients": client_snaps,
         }
         write_state_json(io_root, r, state)
+
+        # --- optional: mock controller decides an action for this round ---
+        if args.controller == "mock":
+            # read the same in-memory 'state' we just wrote
+            mock_action = mock_decide_action(state, n_clients=len(clients))
+            write_action_json(io_root, r, mock_action)  # saves with policy_source
+
+            # apply mock decision to this round's hp + per-client scales
+            # (keep v4 warmup/rollback outside; we override hp right here for mock)
+            hp = {
+                "lr": float(args.lr),  # base lr stays same; we’ll scale per-client below
+                "replay_ratio": float(mock_action["client_params"][0]["replay_ratio"]) if mock_action["client_params"] else 0.50,
+                "notes": "mock agent",
+            }
+
+            # per-client lr scales from action (if present)
+            cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in mock_action.get("client_params", [])}
+            for c in clients:
+                scale = cid2scale.get(int(c.cid), 1.0)
+                for pg in c.optimizer.param_groups:
+                    pg["lr"] = hp["lr"] * scale
+                c._last_lr_scale = float(scale)
 
         # ---- POLICY DECISION (Controller v4) ----
         if args.use_policy:
