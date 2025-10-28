@@ -340,18 +340,17 @@ def main():
 
         # --- optional: mock controller decides an action for this round ---
         if args.controller == "mock":
-            # read the same in-memory 'state' we just wrote
             mock_action = mock_decide_action(state, n_clients=len(clients))
-            write_action_json(io_root, r, mock_action, policy_source="Mock")  # saves with policy_source
+            write_action_json(io_root, r, mock_action, policy_source="Mock")
 
-            # apply mock decision to this round's hp + per-client scales
+            # apply mock decision to this roundif args.controller == "v4":
             hp = {
-                "lr": float(args.lr),  # base lr stays same; we’ll scale per-client below
+                "lr": float(args.lr),
                 "replay_ratio": float(mock_action["client_params"][0]["replay_ratio"]) if mock_action["client_params"] else 0.50,
                 "notes": "mock agent",
             }
 
-            # per-client lr scales from action (if present)
+            # per-client LR scaling from action
             cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in mock_action.get("client_params", [])}
             for c in clients:
                 scale = cid2scale.get(int(c.cid), 1.0)
@@ -360,7 +359,7 @@ def main():
                 c._last_lr_scale = float(scale)
 
         # ---- POLICY DECISION (Controller v4) ----
-        if args.use_policy:
+        if args.controller == "v4":
             # rollback branch
             if rollback_flag:
                 lr = best_hp["lr"]
