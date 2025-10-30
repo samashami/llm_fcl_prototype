@@ -34,6 +34,100 @@ V4_CLIENT_LR_MIN, V4_CLIENT_LR_MAX = 0.8, 1.2
 V4_ROLLBACK_THR  = 0.02         # absolute acc drop
 V4_WARMUP_ROUNDS = 2
 
+
+# --- SFT controller helper (local tiny model) ---
+def _compact_state_for_sft(state):
+    g = state["global"]
+    keep = {
+        "acc": float(round(g["acc"], 4)),
+        "ema_loss": float(round(g["ema_loss"], 4)),
+        "forget_mean": float(round(g["forget_mean"], 4)),
+        "divergence": float(round(g["divergence"], 4)),
+    }
+    clients = []
+    for c in state["clients"]:
+        vloss = c["vloss"]
+        if isinstance(vloss, float) and vloss != vloss:  # NaN
+            vloss = None
+        clients.append({
+            "id": int(c["id"]),
+            "vloss": None if vloss is None else float(vloss),
+            "vacc": float(c["vacc"]),
+            "new_batch_size": int(c["new_batch_size"]),
+            "last_lr": float(c["last_lr"]),
+        })
+    return {"global": keep, "clients": clients}
+
+def _balanced_json_from_text(s, anchor="ACTION:\n{"):
+    # take the last occurrence (if any) to be robust
+    if anchor in s:
+        s = s.split(anchor)[-1]
+        s = "{" + s
+    depth, end_idx = 0, None
+    for i, ch in enumerate(s):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = i + 1
+                break
+    return s[:end_idx] if end_idx else "{}"
+
+_sft_cache = {"tok": None, "mdl": None}
+
+def sft_decide_action(state, model_dir="sft_model_distilgpt2", fewshot=True):
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import json, torch
+
+    # lazy load (keeps it fast across rounds)
+    if _sft_cache["tok"] is None:
+        tok = AutoTokenizer.from_pretrained(model_dir)
+        mdl = AutoModelForCausalLM.from_pretrained(model_dir)
+        tok.pad_token = tok.eos_token
+        _sft_cache["tok"], _sft_cache["mdl"] = tok, mdl
+    else:
+        tok, mdl = _sft_cache["tok"], _sft_cache["mdl"]
+
+    s_small = _compact_state_for_sft(state)
+
+    demo = ""
+    if fewshot:
+        demo = (
+            "You output ONLY one JSON object that matches this schema exactly:\n"
+            '{ "client_selection_k": <int>, "aggregation": {"method":"FedAvg"}, '
+            '"client_params":[{"id":0,"replay_ratio":<float>,"lr_scale":<float>,"ewc_lambda":<float>},'
+            '{"id":1,"replay_ratio":<float>,"lr_scale":<float>,"ewc_lambda":<float>}]} \n'
+            "Bounds: replay_ratio ∈ [0.0,0.7], lr_scale ∈ [0.5,1.5], ewc_lambda ∈ [0.0,10.0].\n"
+            "Do not add explanations.\n\n"
+            "Example:\n"
+            'STATE: {"global":{"acc":0.011,"ema_loss":4.73,"forget_mean":0.001,"divergence":0.001},'
+            '"clients":[{"id":0,"vloss":4.68,"vacc":1.36,"new_batch_size":45,"last_lr":0.00012},'
+            '{"id":1,"vloss":4.67,"vacc":1.34,"new_batch_size":45,"last_lr":0.00012}]}\n'
+            "ACTION:\n"
+            '{"client_selection_k":2,"aggregation":{"method":"FedAvg"},"client_params":['
+            '{"id":0,"replay_ratio":0.5,"lr_scale":0.8,"ewc_lambda":0.0},'
+            '{"id":1,"replay_ratio":0.5,"lr_scale":1.2,"ewc_lambda":0.0}]}\n\n'
+        )
+
+    prompt = demo + f"STATE: {json.dumps(s_small)}\nACTION:\n{{"
+    inputs = tok(prompt, return_tensors="pt")
+    with torch.no_grad():
+        gen = _sft_cache["mdl"].generate(
+            **inputs,
+            max_new_tokens=180,
+            do_sample=False,
+            pad_token_id=tok.eos_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+    out_text = tok.decode(gen[0], skip_special_tokens=True)
+    raw_json = _balanced_json_from_text(out_text)
+
+    try:
+        return json.loads(raw_json)
+    except Exception:
+        return {}
+
 # ---------------------------
 # Seeding helpers
 # ---------------------------
@@ -113,7 +207,7 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
-    ap.add_argument("--controller", choices=["v4", "mock", "fixed"], default="v4")
+    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft"], default="v4")
     args = ap.parse_args()
 
     set_seeds(args.seed)
@@ -337,6 +431,31 @@ def main():
             "clients": client_snaps,
         }
         write_state_json(io_root, r, state)
+
+    # --- optional: SFT controller decides an action for this round ---
+    if args.controller == "sft":
+        raw = sft_decide_action(state, model_dir="sft_model_distilgpt2")
+        action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v0")
+        write_action_json(io_root, r, action, policy_source="SFT_v0")
+
+        # Apply SFT decision to HP + per-client LR scales (like mock)
+        hp = {
+            "lr": float(args.lr),  # keep base LR; we scale per-client
+            "replay_ratio": float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50,
+            "notes": "SFT_v0",
+        }
+        cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in action.get("client_params", [])}
+        for c in clients:
+            scale = cid2scale.get(int(c.cid), 1.0)
+            for pg in c.optimizer.param_groups:
+                pg["lr"] = hp["lr"] * scale
+            c._last_lr_scale = float(scale)
+
+        # Remember chosen HP so downstream logging stays consistent
+        last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
+
+        # Skip the v4 policy block for this round
+        args.use_policy = False
 
         # --- optional: mock controller decides an action for this round ---
         if args.controller == "mock":
