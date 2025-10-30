@@ -12,6 +12,8 @@ Build SFT pairs from runs/* {state_round_*.json, action_round_*.json}.
 
 import argparse, json, math, os, glob, re, random
 from collections import defaultdict
+# run_llm_fcl_controller.py
+from src._bootstrap_env import *  # sets TOKENIZERS_PARALLELISM=false early
 
 def _is_num(x):
     return isinstance(x, (int, float))

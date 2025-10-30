@@ -16,6 +16,8 @@ from src.agent_io import save_json, validate_and_clamp_action
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
 import os, json
+# run_llm_fcl_controller.py
+from src._bootstrap_env import *  # sets TOKENIZERS_PARALLELISM=false early
 
 # ---------------------------
 # Controller v4 hyperparams
