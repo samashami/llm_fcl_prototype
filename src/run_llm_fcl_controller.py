@@ -212,8 +212,13 @@ def main():
     ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft"], default="v4")
     args = ap.parse_args()
 
-    controller_name = {"v4": "ControllerV4", "mock": "Mock", "fixed": "Fixed"}[args.controller]
-
+    controller_name = {
+        "v4": "ControllerV4",
+        "mock": "Mock",
+        "fixed": "Fixed",
+        "sft": "SFT_v0",
+    }[args.controller]
+    
     set_seeds(args.seed)
     device = torch.device(args.device)
     print(f"Using device: {device}", flush=True)
