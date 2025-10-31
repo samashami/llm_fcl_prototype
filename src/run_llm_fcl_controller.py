@@ -212,10 +212,13 @@ def main():
     ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft"], default="v4")
     args = ap.parse_args()
 
+    controller_name = {"v4": "ControllerV4", "mock": "Mock", "fixed": "Fixed"}[args.controller]
+
     set_seeds(args.seed)
     device = torch.device(args.device)
     print(f"Using device: {device}", flush=True)
 
+    
     global GLOBAL_SEED
     GLOBAL_SEED = args.seed
 
@@ -455,6 +458,30 @@ def main():
 
         # Remember chosen HP so downstream logging stays consistent
         last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
+
+        # ---- Build and persist the ACTION JSON for this round ----
+        # Simple per-client LR scale pattern for visibility in logs/dataset
+        _scales = [0.8, 1.2] if len(clients) >= 2 else [1.0] * len(clients)
+
+        action = {
+            "client_selection_k": len(clients),
+            "aggregation": {"method": "FedAvg"},
+            "client_params": [
+                {
+                    "id": c.cid,
+                    "replay_ratio": float(hp["replay_ratio"]),
+                    "lr_scale": float(_scales[i % len(_scales)]),
+                    "ewc_lambda": 0.0,
+                }
+                for i, c in enumerate(clients)
+            ],
+            # this is only for in-memory display; validate_action will overwrite it
+            "policy_source": controller_name,
+        }
+
+        # Validate + write with the readable policy tag (ControllerV4 / Mock / Fixed)
+        action = validate_action(action, n_clients=len(clients), policy_source=controller_name)
+        write_action_json(io_root, r, action, policy_source=controller_name)
 
         # Skip the v4 policy block for this round
         args.use_policy = False
