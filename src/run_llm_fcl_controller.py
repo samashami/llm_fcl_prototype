@@ -524,6 +524,7 @@ def main():
 
         # ---- POLICY DECISION (Controller v4) ----
         if args.controller == "v4":
+            dacc = float(acc - last_acc)
             # rollback branch
             if rollback_flag:
                 lr = best_hp["lr"]
