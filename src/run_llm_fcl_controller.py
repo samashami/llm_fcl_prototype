@@ -12,7 +12,7 @@ from src.model import build_resnet18
 from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
-from src.agent_io import save_json, validate_and_clamp_action
+from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
 import os, json
@@ -198,7 +198,6 @@ def main():
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--subset_per_client", type=int, default=-1, help="use -1 for all data")
-    ap.add_argument("--use_policy", action="store_true", default=True)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_interval", type=int, default=50)
@@ -220,7 +219,24 @@ def main():
     }[args.controller]
     
     set_seeds(args.seed)
-    device = torch.device(args.device)
+    # safe device selection with fallback for mac (no CUDA)
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        try:
+            if args.device == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError("CUDA not available")
+            if args.device == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+                raise RuntimeError("MPS not available")
+            device = torch.device(args.device)
+        except Exception as e:
+            print(f"Warning: requested device '{args.device}' not available ({e}); falling back to cpu", flush=True)
+            device = torch.device("cpu")
     print(f"Using device: {device}", flush=True)
 
     
@@ -435,67 +451,63 @@ def main():
                 "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
                 "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
                 "divergence": float(div_norm),
-                "bytes_last_round": int(bytes_last_round if 'bytes_last_round' in locals() else 0),
+                "bytes_last_round": int(bytes_last_round) if 'bytes_last_round' in locals() else 0,
                 "bytes_cum": int(bytes_cum),
             },
             "clients": client_snaps,
         }
         write_state_json(io_root, r, state)
 
-    # --- optional: SFT controller decides an action for this round ---
-    if args.controller == "sft":
-        raw = sft_decide_action(state, model_dir="sft_model_distilgpt2")
-        action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v0")
-        write_action_json(io_root, r, action, policy_source="SFT_v0")
+        # --- optional: SFT controller decides an action for this round ---
+        if args.controller == "sft":
+            raw = sft_decide_action(state, model_dir="sft_model_distilgpt2")
+            action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v0")
+            write_action_json(io_root, r, action, policy_source="SFT_v0")
 
-        # Apply SFT decision to HP + per-client LR scales (like mock)
-        hp = {
-            "lr": float(args.lr),  # keep base LR; we scale per-client
-            "replay_ratio": float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50,
-            "notes": "SFT_v0",
-        }
-        cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in action.get("client_params", [])}
-        for c in clients:
-            scale = cid2scale.get(int(c.cid), 1.0)
-            for pg in c.optimizer.param_groups:
-                pg["lr"] = hp["lr"] * scale
-            c._last_lr_scale = float(scale)
+            # Apply SFT decision to HP + per-client LR scales (like mock)
+            hp = {
+                "lr": float(args.lr),  # keep base LR; we scale per-client
+                "replay_ratio": float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50,
+                "notes": "SFT_v0",
+            }
+            cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in action.get("client_params", [])}
+            for c in clients:
+                scale = cid2scale.get(int(c.cid), 1.0)
+                for pg in c.optimizer.param_groups:
+                    pg["lr"] = hp["lr"] * scale
+                c._last_lr_scale = float(scale)
 
-        # Remember chosen HP so downstream logging stays consistent
-        last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
+            last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
 
-        # ---- Build and persist the ACTION JSON for this round ----
-        # Simple per-client LR scale pattern for visibility in logs/dataset
-        _scales = [0.8, 1.2] if len(clients) >= 2 else [1.0] * len(clients)
+            # ---- Build and persist the ACTION JSON for this round ----
+            # Simple per-client LR scale pattern for visibility in logs/dataset
+            _scales = [0.8, 1.2] if len(clients) >= 2 else [1.0] * len(clients)
 
-        action = {
-            "client_selection_k": len(clients),
-            "aggregation": {"method": "FedAvg"},
-            "client_params": [
-                {
-                    "id": c.cid,
-                    "replay_ratio": float(hp["replay_ratio"]),
-                    "lr_scale": float(_scales[i % len(_scales)]),
-                    "ewc_lambda": 0.0,
-                }
-                for i, c in enumerate(clients)
-            ],
-            # this is only for in-memory display; validate_action will overwrite it
-            "policy_source": controller_name,
-        }
+            action = {
+                "client_selection_k": len(clients),
+                "aggregation": {"method": "FedAvg"},
+                "client_params": [
+                    {
+                        "id": c.cid,
+                        "replay_ratio": float(hp["replay_ratio"]),
+                        "lr_scale": float(_scales[i % len(_scales)]),
+                        "ewc_lambda": 0.0,
+                    }
+                    for i, c in enumerate(clients)
+                ],
+                # this is only for in-memory display; validate_action will overwrite it
+                "policy_source": controller_name,
+            }
 
-        # Validate + write with the readable policy tag (ControllerV4 / Mock / Fixed)
-        action = validate_action(action, n_clients=len(clients), policy_source=controller_name)
-        write_action_json(io_root, r, action, policy_source=controller_name)
-
-        # Skip the v4 policy block for this round
-        args.use_policy = False
+            # Validate + write with the readable policy tag (ControllerV4 / Mock / Fixed)
+            action = validate_action(action, n_clients=len(clients), policy_source=controller_name)
+            write_action_json(io_root, r, action, policy_source=controller_name)
 
         # --- optional: mock controller decides an action for this round ---
         if args.controller == "mock":
             mock_action = mock_decide_action(state, n_clients=len(clients))
 
-            # apply mock decision to this roundif args.controller == "v4":
+            # apply mock decision to this round
             hp = {
                 "lr": float(args.lr),
                 "replay_ratio": float(mock_action["client_params"][0]["replay_ratio"]) if mock_action["client_params"] else 0.50,
@@ -533,133 +545,133 @@ def main():
                 L_ema = float(ema_loss)
                 div = float(div_norm)
 
-                # Deadband on accuracy
-                if abs(dacc) < V4_DEADBAND:
-                    notes.append(f"deadband(|dacc|<{V4_DEADBAND})")
-                else:
-                    # Replay scheduling by forgetting/divergence
-                    if F_t > V4_FORGET_THR or div > V4_DIV_THR:
-                        rep += V4_REP_STEP_HIGH
-                        notes.append("replay↑ (forget/div high)")
-                    else:
-                        rep -= V4_REP_STEP_LOW
-                        notes.append("replay↓ (forget low)")
-
-                    # LR by stability/convergence
-                    if dacc < -V4_DEADBAND:
-                        lr /= V4_LR_COOLDOWN
-                        notes.append("lr↓ (dacc<0)")
-                    elif dacc > V4_DEADBAND and L_ema > 1.5:
-                        lr *= V4_LR_BOOST
-                        notes.append("lr↑ (loss high & improving)")
-
-            # Clamp
-            lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
-            rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
-            notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
-            hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
-        else:
-            hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
-
-        # Log policy line
-        F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
-        print(
-            f"[Policy r={r}] acc={acc:.3f} dacc={acc_delta:+.3f} F_t={F_t_print:.3f} Div={div_norm:.3f} "
-            f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
-            flush=True,
-        )
-
-        # Remember chosen HP
-        last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
-
-        # ---- Broadcast global and set per-client LR scaling (inverted by loss rank) ----
-        vlosses = []
-        for c in clients:
-            v = getattr(c, "_last_vloss", None)
-            vlosses.append(float(v) if v is not None and not np.isnan(v) else float(global_loss))
-        vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
-        rng_v = max(1e-8, vl_max - vl_min)
-
-        for i, c in enumerate(clients):
-            c.load_state_from(global_model)
-            rank = (vlosses[i] - vl_min) / rng_v           # 0..1 (higher = worse loss)
-            scale = V4_CLIENT_LR_MIN + (1.0 - rank) * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN)
-            scale = max(V4_CLIENT_LR_MIN, min(V4_CLIENT_LR_MAX, scale))
-            for pg in c.optimizer.param_groups:
-                pg["lr"] = hp["lr"] * float(scale)
-            c._last_lr_scale = float(scale)
-
-        # --- build canonical Action from the chosen hp + client scales ---
-        action = {
-            "client_selection_k": len(clients),
-            "aggregation": {"method": "FedAvg"},
-            "client_params": [
-                {
-                    "id": int(c.cid),
-                    "replay_ratio": float(hp["replay_ratio"]),
-                    "lr_scale": float(getattr(c, "_last_lr_scale", 1.0)),
-                    "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
-                }
-                for c in clients
-            ],
-        }
-
-        # tag by controller type
-        source = (
-            "Mock" if args.controller == "mock"
-            else "ControllerV4" if args.controller == "v4"
-            else "Fixed"
-        )
-
-        action = validate_action(action, n_clients=len(clients), policy_source=source)
-        write_action_json(io_root, r, action, policy_source=source)
-
-        # ---- Local training per client (once) ----
-        for c in clients:
-            batches = cl_schedule[c.cid]
-            if r < len(batches):
-                batch_indices = batches[r]
-                batch_id = r
+            # Deadband on accuracy
+            if abs(dacc) < V4_DEADBAND:
+                notes.append(f"deadband(|dacc|<{V4_DEADBAND})")
             else:
-                batch_indices = batches[-1]
-                batch_id = len(batches) - 1
+                # Replay scheduling by forgetting/divergence
+                if F_t > V4_FORGET_THR or div > V4_DIV_THR:
+                    rep += V4_REP_STEP_HIGH
+                    notes.append("replay↑ (forget/div high)")
+                else:
+                    rep -= V4_REP_STEP_LOW
+                    notes.append("replay↓ (forget low)")
 
-            c.loader = DataLoader(
-                Subset(trainset_full, batch_indices),
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=args.num_workers,
-                pin_memory=True,
-                worker_init_fn=seed_worker,
-                generator=g,
+                # LR by stability/convergence
+                if dacc < -V4_DEADBAND:
+                    lr /= V4_LR_COOLDOWN
+                    notes.append("lr↓ (dacc<0)")
+                elif dacc > V4_DEADBAND and L_ema > 1.5:
+                    lr *= V4_LR_BOOST
+                    notes.append("lr↑ (loss high & improving)")
+
+        # Clamp
+        lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
+        rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
+        notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
+        hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
+    else:
+        hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
+
+    # Log policy line
+    F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
+    print(
+        f"[Policy r={r}] acc={acc:.3f} dacc={acc_delta:+.3f} F_t={F_t_print:.3f} Div={div_norm:.3f} "
+        f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
+        flush=True,
+    )
+
+    # Remember chosen HP
+    last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
+
+    # ---- Broadcast global and set per-client LR scaling (inverted by loss rank) ----
+    vlosses = []
+    for c in clients:
+        v = getattr(c, "_last_vloss", None)
+        vlosses.append(float(v) if v is not None and not np.isnan(v) else float(global_loss))
+    vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
+    rng_v = max(1e-8, vl_max - vl_min)
+
+    for i, c in enumerate(clients):
+        c.load_state_from(global_model)
+        rank = (vlosses[i] - vl_min) / rng_v           # 0..1 (higher = worse loss)
+        scale = V4_CLIENT_LR_MIN + (1.0 - rank) * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN)
+        scale = max(V4_CLIENT_LR_MIN, min(V4_CLIENT_LR_MAX, scale))
+        for pg in c.optimizer.param_groups:
+            pg["lr"] = hp["lr"] * float(scale)
+        c._last_lr_scale = float(scale)
+
+    # --- build canonical Action from the chosen hp + client scales ---
+    action = {
+        "client_selection_k": len(clients),
+        "aggregation": {"method": "FedAvg"},
+        "client_params": [
+            {
+                "id": int(c.cid),
+                "replay_ratio": float(hp["replay_ratio"]),
+                "lr_scale": float(getattr(c, "_last_lr_scale", 1.0)),
+                "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
+            }
+            for c in clients
+        ],
+    }
+
+    # tag by controller type
+    source = (
+        "Mock" if args.controller == "mock"
+        else "ControllerV4" if args.controller == "v4"
+        else "Fixed"
+    )
+
+    action = validate_action(action, n_clients=len(clients), policy_source=source)
+    write_action_json(io_root, r, action, policy_source=source)
+
+    # ---- Local training per client (once) ----
+    for c in clients:
+        batches = cl_schedule[c.cid]
+        if r < len(batches):
+            batch_indices = batches[r]
+            batch_id = r
+        else:
+            batch_indices = batches[-1]
+            batch_id = len(batches) - 1
+
+        c.loader = DataLoader(
+            Subset(trainset_full, batch_indices),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+
+        print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
+                f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
+                flush=True)
+
+        for e in range(args.epochs):
+            avg_loss, epoch_acc, stop = c.train_one_epoch(
+                replay_ratio=hp["replay_ratio"],
+                epoch=e,
+                total_epochs=args.epochs,
+                log_interval=args.log_interval,
             )
-
-            print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
-                  f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
-                  flush=True)
-
-            for e in range(args.epochs):
-                avg_loss, epoch_acc, stop = c.train_one_epoch(
-                    replay_ratio=hp["replay_ratio"],
-                    epoch=e,
-                    total_epochs=args.epochs,
-                    log_interval=args.log_interval,
-                )
-                run_logs.append({
-                    "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
-                    "epoch": e + 1,
-                    "lr": float(c.optimizer.param_groups[0]["lr"]),
-                    "replay_ratio": float(hp["replay_ratio"]),
-                    "cl_batch": batch_id + 1,
-                    "cl_batch_size": len(batch_indices),
-                    "train_loss": float(avg_loss),
-                    "train_acc": float(epoch_acc),
-                    "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
-                    "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
-                })
-                if stop:
-                    print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
-                    break
+            run_logs.append({
+                "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
+                "epoch": e + 1,
+                "lr": float(c.optimizer.param_groups[0]["lr"]),
+                "replay_ratio": float(hp["replay_ratio"]),
+                "cl_batch": batch_id + 1,
+                "cl_batch_size": len(batch_indices),
+                "train_loss": float(avg_loss),
+                "train_acc": float(epoch_acc),
+                "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
+                "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
+            })
+            if stop:
+                print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
+                break
 
         # ---- Divergence (before FedAvg) ----
         with torch.no_grad():
