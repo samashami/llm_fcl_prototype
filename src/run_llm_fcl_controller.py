@@ -499,10 +499,6 @@ def main():
                 "policy_source": controller_name,
             }
 
-            # Validate + write with the readable policy tag (ControllerV4 / Mock / Fixed)
-            action = validate_action(action, n_clients=len(clients), policy_source=controller_name)
-            write_action_json(io_root, r, action, policy_source=controller_name)
-
         # --- optional: mock controller decides an action for this round ---
         if args.controller == "mock":
             mock_action = mock_decide_action(state, n_clients=len(clients))
