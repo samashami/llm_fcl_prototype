@@ -521,6 +521,11 @@ def main():
         # ---- POLICY DECISION (Controller v4) ----
         if args.controller == "v4":
             dacc = float(acc - last_acc)
+            #  safe defaults so later logic never references undefined names
+            F_t = float(np.mean(forgetting)) if forgetting is not None else 0.0
+            L_ema = float(ema_loss)
+            div = float(div_norm)
+
             # rollback branch
             if rollback_flag:
                 lr = best_hp["lr"]
@@ -562,13 +567,13 @@ def main():
                     lr *= V4_LR_BOOST
                     notes.append("lr↑ (loss high & improving)")
 
-        # Clamp
-        lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
-        rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
-        notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
-        hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
-    else:
-        hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
+            # Clamp
+            lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
+            rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
+            notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
+            hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
+        else:
+            hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
 
     # Log policy line
     F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
