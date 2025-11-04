@@ -408,6 +408,7 @@ def main():
             return float(c.optimizer.param_groups[0]["lr"])
         except Exception:
             return float(fallback_lr)
+        
     # ---------------------------
     # Training rounds
     # ---------------------------
@@ -418,16 +419,16 @@ def main():
     for r in range(args.rounds):
         acc_delta = float(acc - last_acc)
 
-        # --- Build and write state JSON (once, at round start) ---
+        # --- Build and write STATE JSON (once, at round start) ---
         client_snaps = []
         for c in clients:
             # robust last_lr: if optimizer exists use it, else fallback to last chosen HP or CLI LR
             if hasattr(c, "optimizer") and getattr(c.optimizer, "param_groups", None):
-                _lr = float(c.optimizer.param_groups[0]["lr"])
+                _lr_snapshot = float(c.optimizer.param_groups[0]["lr"])
             else:
-                _lr = float(last_hp.get("lr", args.lr))
+                _lr_snapshot = float(last_hp.get("lr", args.lr))
 
-            # new batch size for THIS round for this client
+            # new batch size for THIS round for this client (size of incoming CL chunk)
             batches = cl_schedule[c.cid]
             nb = len(batches[r]) if r < len(batches) else len(batches[-1])
 
@@ -437,7 +438,7 @@ def main():
                 "vacc": float(getattr(c, "_last_vacc", float("nan"))),
                 "new_batch_size": int(nb),
                 "replay_capacity": int(getattr(getattr(c, "replay", None), "capacity", 2000)),
-                "last_lr": _safe_last_lr(c, hp["lr"] if 'hp' in locals() else args.lr),
+                "last_lr": _lr_snapshot,
                 "last_replay_ratio": float(last_hp.get("replay_ratio", 0.50)),
                 "last_ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
             })
@@ -451,229 +452,198 @@ def main():
                 "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
                 "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
                 "divergence": float(div_norm),
-                "bytes_last_round": int(bytes_last_round) if 'bytes_last_round' in locals() else 0,
+                "bytes_last_round": int(bytes_last_round),
                 "bytes_cum": int(bytes_cum),
             },
             "clients": client_snaps,
         }
         write_state_json(io_root, r, state)
 
-        # --- optional: SFT controller decides an action for this round ---
+        # =========================================================
+        # Decide action ONCE (by controller) -> validate ONCE
+        # =========================================================
         if args.controller == "sft":
+            # SFT: the tiny local LM returns JSON; we validate & clamp it.
             raw = sft_decide_action(state, model_dir="sft_model_distilgpt2")
             action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v0")
-            write_action_json(io_root, r, action, policy_source="SFT_v0")
+            hp_lr = float(args.lr)
+            rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
+            hp_notes = "SFT_v0"
 
-            # Apply SFT decision to HP + per-client LR scales (like mock)
-            hp = {
-                "lr": float(args.lr),  # keep base LR; we scale per-client
-                "replay_ratio": float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50,
-                "notes": "SFT_v0",
-            }
-            cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in action.get("client_params", [])}
+        elif args.controller == "mock":
+            # Mock: synthetic policy for plumbing / dataset creation
+            raw = mock_decide_action(state, n_clients=len(clients))
+            action = validate_action(raw, n_clients=len(clients), policy_source="Mock")
+            hp_lr = float(args.lr)
+            rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
+            hp_notes = "Mock"
+
+        elif args.controller == "v4":
+            # Controller V4: compute hp (lr/rep) from simple signals
+            dacc = float(acc - last_acc)
+            F_t  = float(np.mean(forgetting)) if forgetting is not None else 0.0
+            L_ema = float(ema_loss)
+            div   = float(div_norm)
+
+            if rollback_flag:
+                lr = float(best_hp["lr"])
+                rep = float(best_hp["replay_ratio"])
+                notes = [f"ROLLBACK(r{rollback_round}→best r{best_round})"]
+                rollback_flag = False
+            elif r < V4_WARMUP_ROUNDS:
+                lr, rep = float(args.lr), 0.50
+                notes = ["warmup (fixed defaults)"]
+            else:
+                lr, rep = float(last_hp["lr"]), float(last_hp["replay_ratio"])
+                notes = ["policy_v4"]
+
+                if abs(dacc) < V4_DEADBAND:
+                    notes.append(f"deadband(|dacc|<{V4_DEADBAND})")
+                else:
+                    if F_t > V4_FORGET_THR or div > V4_DIV_THR:
+                        rep += V4_REP_STEP_HIGH
+                        notes.append("replay↑ (forget/div high)")
+                    else:
+                        rep -= V4_REP_STEP_LOW
+                        notes.append("replay↓ (forget low)")
+
+                    if dacc < -V4_DEADBAND:
+                        lr /= V4_LR_COOLDOWN
+                        notes.append("lr↓ (dacc<0)")
+                    elif dacc > V4_DEADBAND and L_ema > 1.5:
+                        lr *= V4_LR_BOOST
+                        notes.append("lr↑ (loss high & improving)")
+
+            # clamp hp
+            lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
+            rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
+            notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
+
+            # build per-client scales by vloss rank (higher loss → lower scale)
+            vlosses = []
             for c in clients:
-                scale = cid2scale.get(int(c.cid), 1.0)
-                for pg in c.optimizer.param_groups:
-                    pg["lr"] = hp["lr"] * scale
-                c._last_lr_scale = float(scale)
+                v = getattr(c, "_last_vloss", None)
+                vlosses.append(float(v) if v is not None and not np.isnan(v) else float(global_loss))
+            vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
+            rng_v = max(1e-8, vl_max - vl_min)
 
-            last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
-
-            # ---- Build and persist the ACTION JSON for this round ----
-            # Simple per-client LR scale pattern for visibility in logs/dataset
-            _scales = [0.8, 1.2] if len(clients) >= 2 else [1.0] * len(clients)
-
-            action = {
+            candidate = {
                 "client_selection_k": len(clients),
                 "aggregation": {"method": "FedAvg"},
                 "client_params": [
                     {
-                        "id": c.cid,
-                        "replay_ratio": float(hp["replay_ratio"]),
-                        "lr_scale": float(_scales[i % len(_scales)]),
-                        "ewc_lambda": 0.0,
+                        "id": int(c.cid),
+                        "replay_ratio": float(rep),
+                        "lr_scale": float(
+                            max(V4_CLIENT_LR_MIN,
+                                min(V4_CLIENT_LR_MAX,
+                                    V4_CLIENT_LR_MIN + (1.0 - ((vlosses[i] - vl_min) / rng_v)) * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN)
+                                )
+                            )
+                        ),
+                        "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
                     }
                     for i, c in enumerate(clients)
                 ],
-                # this is only for in-memory display; validate_action will overwrite it
-                "policy_source": controller_name,
             }
+            action = validate_action(candidate, n_clients=len(clients), policy_source="ControllerV4")
+            hp_lr = float(lr)
+            hp_notes = " | ".join(notes)
 
-        # --- optional: mock controller decides an action for this round ---
-        if args.controller == "mock":
-            mock_action = mock_decide_action(state, n_clients=len(clients))
-
-            # apply mock decision to this round
-            hp = {
-                "lr": float(args.lr),
-                "replay_ratio": float(mock_action["client_params"][0]["replay_ratio"]) if mock_action["client_params"] else 0.50,
-                "notes": "mock agent",
-            }
-
-            # per-client LR scaling from action
-            cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in mock_action.get("client_params", [])}
-            for c in clients:
-                scale = cid2scale.get(int(c.cid), 1.0)
-                for pg in c.optimizer.param_groups:
-                    pg["lr"] = hp["lr"] * scale
-                c._last_lr_scale = float(scale)
-
-        # ---- POLICY DECISION (Controller v4) ----
-        if args.controller == "v4":
-            dacc = float(acc - last_acc)
-            #  safe defaults so later logic never references undefined names
-            F_t = float(np.mean(forgetting)) if forgetting is not None else 0.0
-            L_ema = float(ema_loss)
-            div = float(div_norm)
-
-            # rollback branch
-            if rollback_flag:
-                lr = best_hp["lr"]
-                rep = best_hp["replay_ratio"]
-                notes = [f"ROLLBACK(r{rollback_round}→best r{best_round})"]
-                rollback_flag = False  # consume flag
-
-            elif r < V4_WARMUP_ROUNDS:
-                lr, rep = args.lr, 0.50
-                notes = ["warmup (fixed defaults)"]
-
-            else:
-                # Base on last stable HP
-                lr, rep = last_hp["lr"], last_hp["replay_ratio"]
-                notes = ["policy_v4"]
-
-                F_t = float(np.mean(forgetting))  # mean forgetting
-                dacc = acc_delta
-                L_ema = float(ema_loss)
-                div = float(div_norm)
-
-            # Deadband on accuracy
-            if abs(dacc) < V4_DEADBAND:
-                notes.append(f"deadband(|dacc|<{V4_DEADBAND})")
-            else:
-                # Replay scheduling by forgetting/divergence
-                if F_t > V4_FORGET_THR or div > V4_DIV_THR:
-                    rep += V4_REP_STEP_HIGH
-                    notes.append("replay↑ (forget/div high)")
-                else:
-                    rep -= V4_REP_STEP_LOW
-                    notes.append("replay↓ (forget low)")
-
-                # LR by stability/convergence
-                if dacc < -V4_DEADBAND:
-                    lr /= V4_LR_COOLDOWN
-                    notes.append("lr↓ (dacc<0)")
-                elif dacc > V4_DEADBAND and L_ema > 1.5:
-                    lr *= V4_LR_BOOST
-                    notes.append("lr↑ (loss high & improving)")
-
-            # Clamp
-            lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
-            rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
-            notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
-            hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
         else:
-            hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
-
-    # Log policy line
-    F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
-    print(
-        f"[Policy r={r}] acc={acc:.3f} dacc={acc_delta:+.3f} F_t={F_t_print:.3f} Div={div_norm:.3f} "
-        f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
-        flush=True,
-    )
-
-    # Remember chosen HP
-    last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
-
-    # ---- Broadcast global and set per-client LR scaling (inverted by loss rank) ----
-    vlosses = []
-    for c in clients:
-        v = getattr(c, "_last_vloss", None)
-        vlosses.append(float(v) if v is not None and not np.isnan(v) else float(global_loss))
-    vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
-    rng_v = max(1e-8, vl_max - vl_min)
-
-    for i, c in enumerate(clients):
-        c.load_state_from(global_model)
-        rank = (vlosses[i] - vl_min) / rng_v           # 0..1 (higher = worse loss)
-        scale = V4_CLIENT_LR_MIN + (1.0 - rank) * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN)
-        scale = max(V4_CLIENT_LR_MIN, min(V4_CLIENT_LR_MAX, scale))
-        for pg in c.optimizer.param_groups:
-            pg["lr"] = hp["lr"] * float(scale)
-        c._last_lr_scale = float(scale)
-
-    # --- build canonical Action from the chosen hp + client scales ---
-    action = {
-        "client_selection_k": len(clients),
-        "aggregation": {"method": "FedAvg"},
-        "client_params": [
-            {
-                "id": int(c.cid),
-                "replay_ratio": float(hp["replay_ratio"]),
-                "lr_scale": float(getattr(c, "_last_lr_scale", 1.0)),
-                "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
+            # fixed (paper CL defaults)
+            candidate = {
+                "client_selection_k": len(clients),
+                "aggregation": {"method": "FedAvg"},
+                "client_params": [
+                    {"id": int(c.cid), "replay_ratio": 0.50, "lr_scale": 1.0, "ewc_lambda": 0.0}
+                    for c in clients
+                ],
             }
-            for c in clients
-        ],
-    }
+            action = validate_action(candidate, n_clients=len(clients), policy_source="Fixed")
+            hp_lr = float(args.lr)
+            rep = 0.50
+            hp_notes = "fixed (paper CL default)"
 
-    # tag by controller type
-    source = (
-        "Mock" if args.controller == "mock"
-        else "ControllerV4" if args.controller == "v4"
-        else "Fixed"
-    )
+        # =========================================================
+        # Apply the validated ACTION uniformly (HP + per-client LR)
+        # =========================================================
+        # replay ratio comes from first client entry
+        rep_from_action = (
+            float(action["client_params"][0]["replay_ratio"])
+            if action.get("client_params") else 0.50
+        )
+        hp = {"lr": hp_lr, "replay_ratio": rep_from_action, "notes": hp_notes}
 
-    action = validate_action(action, n_clients=len(clients), policy_source=source)
-    write_action_json(io_root, r, action, policy_source=source)
+        cid2scale = {int(p["id"]): float(p.get("lr_scale", 1.0)) for p in action.get("client_params", [])}
+        for c in clients:
+            scale = cid2scale.get(int(c.cid), 1.0)
+            for pg in c.optimizer.param_groups:
+                pg["lr"] = hp["lr"] * scale
+            c._last_lr_scale = float(scale)
 
-    # ---- Local training per client (once) ----
-    for c in clients:
-        batches = cl_schedule[c.cid]
-        if r < len(batches):
-            batch_indices = batches[r]
-            batch_id = r
-        else:
-            batch_indices = batches[-1]
-            batch_id = len(batches) - 1
-
-        c.loader = DataLoader(
-            Subset(trainset_full, batch_indices),
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=seed_worker,
-            generator=g,
+        # policy line for logs
+        F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
+        print(
+            f"[Policy r={r}] acc={acc:.3f} dacc={acc_delta:+.3f} F_t={F_t_print:.3f} Div={div_norm:.3f} "
+            f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
+            flush=True,
         )
 
-        print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
-                f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
-                flush=True)
+        # persist chosen hp for next round snapshots
+        last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
 
-        for e in range(args.epochs):
-            avg_loss, epoch_acc, stop = c.train_one_epoch(
-                replay_ratio=hp["replay_ratio"],
-                epoch=e,
-                total_epochs=args.epochs,
-                log_interval=args.log_interval,
+        # ---- Write ACTION JSON exactly once per round ----
+        write_action_json(io_root, r, action, policy_source=action.get("policy_source", controller_name))
+
+        # =========================================================
+        # Local training per client
+        # =========================================================
+        for c in clients:
+            batches = cl_schedule[c.cid]
+            if r < len(batches):
+                batch_indices = batches[r]
+                batch_id = r
+            else:
+                batch_indices = batches[-1]
+                batch_id = len(batches) - 1
+
+            c.loader = DataLoader(
+                Subset(trainset_full, batch_indices),
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                worker_init_fn=seed_worker,
+                generator=g,
             )
-            run_logs.append({
-                "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
-                "epoch": e + 1,
-                "lr": float(c.optimizer.param_groups[0]["lr"]),
-                "replay_ratio": float(hp["replay_ratio"]),
-                "cl_batch": batch_id + 1,
-                "cl_batch_size": len(batch_indices),
-                "train_loss": float(avg_loss),
-                "train_acc": float(epoch_acc),
-                "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
-                "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
-            })
-            if stop:
-                print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
-                break
+
+            print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
+                  f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
+                  flush=True)
+
+            for e in range(args.epochs):
+                avg_loss, epoch_acc, stop = c.train_one_epoch(
+                    replay_ratio=hp["replay_ratio"],
+                    epoch=e,
+                    total_epochs=args.epochs,
+                    log_interval=args.log_interval,
+                )
+                run_logs.append({
+                    "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
+                    "epoch": e + 1,
+                    "lr": float(c.optimizer.param_groups[0]["lr"]),
+                    "replay_ratio": float(hp["replay_ratio"]),
+                    "cl_batch": batch_id + 1,
+                    "cl_batch_size": len(batch_indices),
+                    "train_loss": float(avg_loss),
+                    "train_acc": float(epoch_acc),
+                    "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
+                    "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
+                })
+                if stop:
+                    print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
+                    break
 
         # ---- Divergence (before FedAvg) ----
         with torch.no_grad():
@@ -693,12 +663,12 @@ def main():
         global_model = server.average([c.model for c in clients])
         last_acc = float(acc)
         acc, per_class = evaluate(global_model, device, test_loader)
+
         # running mean AULC up to round r
         aulc_running = ((aulc_running * r) + float(acc)) / max(1, (r + 1))
 
         # ---- Rollback check ----
         if acc < best_global_acc - V4_ROLLBACK_THR:
-            # revert to best weights locally
             global_model.load_state_dict(best_state)
             acc, per_class = evaluate(global_model, device, test_loader)
             forgetting = np.maximum(0.0, best_recall - per_class)
@@ -753,6 +723,353 @@ def main():
           f"fcl_run_results_{run_id}_{args.tag}.csv,",
           f"fcl_run_summary_{run_id}_{args.tag}.csv,",
           f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", flush=True)
+
+
+#     # ---------------------------
+#     # Training rounds
+#     # ---------------------------
+#     bytes_last_round = 0  # carried into the next round's state
+#     bytes_cum = 0
+#     aulc_running = 0.0
+
+#     for r in range(args.rounds):
+#         acc_delta = float(acc - last_acc)
+
+#         # --- Build and write state JSON (once, at round start) ---
+#         client_snaps = []
+#         for c in clients:
+#             # robust last_lr: if optimizer exists use it, else fallback to last chosen HP or CLI LR
+#             if hasattr(c, "optimizer") and getattr(c.optimizer, "param_groups", None):
+#                 _lr = float(c.optimizer.param_groups[0]["lr"])
+#             else:
+#                 _lr = float(last_hp.get("lr", args.lr))
+
+#             # new batch size for THIS round for this client
+#             batches = cl_schedule[c.cid]
+#             nb = len(batches[r]) if r < len(batches) else len(batches[-1])
+
+#             client_snaps.append({
+#                 "id": int(c.cid),
+#                 "vloss": float(getattr(c, "_last_vloss", float("nan"))),
+#                 "vacc": float(getattr(c, "_last_vacc", float("nan"))),
+#                 "new_batch_size": int(nb),
+#                 "replay_capacity": int(getattr(getattr(c, "replay", None), "capacity", 2000)),
+#                 "last_lr": _safe_last_lr(c, hp["lr"] if 'hp' in locals() else args.lr),
+#                 "last_replay_ratio": float(last_hp.get("replay_ratio", 0.50)),
+#                 "last_ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
+#             })
+
+#         state = {
+#             "round_id": int(r),
+#             "global": {
+#                 "acc": float(acc),
+#                 "loss": float(global_loss),
+#                 "ema_loss": float(ema_loss),
+#                 "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
+#                 "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
+#                 "divergence": float(div_norm),
+#                 "bytes_last_round": int(bytes_last_round) if 'bytes_last_round' in locals() else 0,
+#                 "bytes_cum": int(bytes_cum),
+#             },
+#             "clients": client_snaps,
+#         }
+#         write_state_json(io_root, r, state)
+
+#         # --- optional: SFT controller decides an action for this round ---
+#         if args.controller == "sft":
+#             raw = sft_decide_action(state, model_dir="sft_model_distilgpt2")
+#             action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v0")
+#             write_action_json(io_root, r, action, policy_source="SFT_v0")
+
+#             # Apply SFT decision to HP + per-client LR scales (like mock)
+#             hp = {
+#                 "lr": float(args.lr),  # keep base LR; we scale per-client
+#                 "replay_ratio": float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50,
+#                 "notes": "SFT_v0",
+#             }
+#             cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in action.get("client_params", [])}
+#             for c in clients:
+#                 scale = cid2scale.get(int(c.cid), 1.0)
+#                 for pg in c.optimizer.param_groups:
+#                     pg["lr"] = hp["lr"] * scale
+#                 c._last_lr_scale = float(scale)
+
+#             last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
+
+#             # ---- Build and persist the ACTION JSON for this round ----
+#             # Simple per-client LR scale pattern for visibility in logs/dataset
+#             _scales = [0.8, 1.2] if len(clients) >= 2 else [1.0] * len(clients)
+
+#             action = {
+#                 "client_selection_k": len(clients),
+#                 "aggregation": {"method": "FedAvg"},
+#                 "client_params": [
+#                     {
+#                         "id": c.cid,
+#                         "replay_ratio": float(hp["replay_ratio"]),
+#                         "lr_scale": float(_scales[i % len(_scales)]),
+#                         "ewc_lambda": 0.0,
+#                     }
+#                     for i, c in enumerate(clients)
+#                 ],
+#                 # this is only for in-memory display; validate_action will overwrite it
+#                 "policy_source": controller_name,
+#             }
+
+#         # --- optional: mock controller decides an action for this round ---
+#         if args.controller == "mock":
+#             mock_action = mock_decide_action(state, n_clients=len(clients))
+
+#             # apply mock decision to this round
+#             hp = {
+#                 "lr": float(args.lr),
+#                 "replay_ratio": float(mock_action["client_params"][0]["replay_ratio"]) if mock_action["client_params"] else 0.50,
+#                 "notes": "mock agent",
+#             }
+
+#             # per-client LR scaling from action
+#             cid2scale = {p["id"]: float(p.get("lr_scale", 1.0)) for p in mock_action.get("client_params", [])}
+#             for c in clients:
+#                 scale = cid2scale.get(int(c.cid), 1.0)
+#                 for pg in c.optimizer.param_groups:
+#                     pg["lr"] = hp["lr"] * scale
+#                 c._last_lr_scale = float(scale)
+
+#         # ---- POLICY DECISION (Controller v4) ----
+#         if args.controller == "v4":
+#             dacc = float(acc - last_acc)
+#             #  safe defaults so later logic never references undefined names
+#             F_t = float(np.mean(forgetting)) if forgetting is not None else 0.0
+#             L_ema = float(ema_loss)
+#             div = float(div_norm)
+
+#             # rollback branch
+#             if rollback_flag:
+#                 lr = best_hp["lr"]
+#                 rep = best_hp["replay_ratio"]
+#                 notes = [f"ROLLBACK(r{rollback_round}→best r{best_round})"]
+#                 rollback_flag = False  # consume flag
+
+#             elif r < V4_WARMUP_ROUNDS:
+#                 lr, rep = args.lr, 0.50
+#                 notes = ["warmup (fixed defaults)"]
+
+#             else:
+#                 # Base on last stable HP
+#                 lr, rep = last_hp["lr"], last_hp["replay_ratio"]
+#                 notes = ["policy_v4"]
+
+#                 F_t = float(np.mean(forgetting))  # mean forgetting
+#                 dacc = acc_delta
+#                 L_ema = float(ema_loss)
+#                 div = float(div_norm)
+
+#             # Deadband on accuracy
+#             if abs(dacc) < V4_DEADBAND:
+#                 notes.append(f"deadband(|dacc|<{V4_DEADBAND})")
+#             else:
+#                 # Replay scheduling by forgetting/divergence
+#                 if F_t > V4_FORGET_THR or div > V4_DIV_THR:
+#                     rep += V4_REP_STEP_HIGH
+#                     notes.append("replay↑ (forget/div high)")
+#                 else:
+#                     rep -= V4_REP_STEP_LOW
+#                     notes.append("replay↓ (forget low)")
+
+#                 # LR by stability/convergence
+#                 if dacc < -V4_DEADBAND:
+#                     lr /= V4_LR_COOLDOWN
+#                     notes.append("lr↓ (dacc<0)")
+#                 elif dacc > V4_DEADBAND and L_ema > 1.5:
+#                     lr *= V4_LR_BOOST
+#                     notes.append("lr↑ (loss high & improving)")
+
+#             # Clamp
+#             lr  = max(V4_LR_MIN,  min(V4_LR_MAX,  lr))
+#             rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
+#             notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
+#             hp = {"lr": lr, "replay_ratio": rep, "notes": " | ".join(notes)}
+#         else:
+#             hp = {"lr": args.lr, "replay_ratio": 0.50, "notes": "fixed (paper CL default)"}
+
+#     # Log policy line
+#     F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
+#     print(
+#         f"[Policy r={r}] acc={acc:.3f} dacc={acc_delta:+.3f} F_t={F_t_print:.3f} Div={div_norm:.3f} "
+#         f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
+#         flush=True,
+#     )
+
+#     # Remember chosen HP
+#     last_hp = {"lr": hp["lr"], "replay_ratio": hp["replay_ratio"], "notes": hp["notes"]}
+
+#     # ---- Broadcast global and set per-client LR scaling (inverted by loss rank) ----
+#     vlosses = []
+#     for c in clients:
+#         v = getattr(c, "_last_vloss", None)
+#         vlosses.append(float(v) if v is not None and not np.isnan(v) else float(global_loss))
+#     vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
+#     rng_v = max(1e-8, vl_max - vl_min)
+
+#     for i, c in enumerate(clients):
+#         c.load_state_from(global_model)
+#         rank = (vlosses[i] - vl_min) / rng_v           # 0..1 (higher = worse loss)
+#         scale = V4_CLIENT_LR_MIN + (1.0 - rank) * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN)
+#         scale = max(V4_CLIENT_LR_MIN, min(V4_CLIENT_LR_MAX, scale))
+#         for pg in c.optimizer.param_groups:
+#             pg["lr"] = hp["lr"] * float(scale)
+#         c._last_lr_scale = float(scale)
+
+#     # --- build canonical Action from the chosen hp + client scales ---
+#     action = {
+#         "client_selection_k": len(clients),
+#         "aggregation": {"method": "FedAvg"},
+#         "client_params": [
+#             {
+#                 "id": int(c.cid),
+#                 "replay_ratio": float(hp["replay_ratio"]),
+#                 "lr_scale": float(getattr(c, "_last_lr_scale", 1.0)),
+#                 "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
+#             }
+#             for c in clients
+#         ],
+#     }
+
+#     # tag by controller type
+#     source = (
+#         "Mock" if args.controller == "mock"
+#         else "ControllerV4" if args.controller == "v4"
+#         else "Fixed"
+#     )
+
+#     action = validate_action(action, n_clients=len(clients), policy_source=source)
+#     write_action_json(io_root, r, action, policy_source=source)
+
+#     # ---- Local training per client (once) ----
+#     for c in clients:
+#         batches = cl_schedule[c.cid]
+#         if r < len(batches):
+#             batch_indices = batches[r]
+#             batch_id = r
+#         else:
+#             batch_indices = batches[-1]
+#             batch_id = len(batches) - 1
+
+#         c.loader = DataLoader(
+#             Subset(trainset_full, batch_indices),
+#             batch_size=args.batch_size,
+#             shuffle=True,
+#             num_workers=args.num_workers,
+#             pin_memory=True,
+#             worker_init_fn=seed_worker,
+#             generator=g,
+#         )
+
+#         print(f"[Round {r}] client {c.cid}: CL batch {batch_id+1}/{len(batches)} "
+#                 f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
+#                 flush=True)
+
+#         for e in range(args.epochs):
+#             avg_loss, epoch_acc, stop = c.train_one_epoch(
+#                 replay_ratio=hp["replay_ratio"],
+#                 epoch=e,
+#                 total_epochs=args.epochs,
+#                 log_interval=args.log_interval,
+#             )
+#             run_logs.append({
+#                 "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
+#                 "epoch": e + 1,
+#                 "lr": float(c.optimizer.param_groups[0]["lr"]),
+#                 "replay_ratio": float(hp["replay_ratio"]),
+#                 "cl_batch": batch_id + 1,
+#                 "cl_batch_size": len(batch_indices),
+#                 "train_loss": float(avg_loss),
+#                 "train_acc": float(epoch_acc),
+#                 "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
+#                 "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
+#             })
+#             if stop:
+#                 print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
+#                 break
+
+#         # ---- Divergence (before FedAvg) ----
+#         with torch.no_grad():
+#             def flat_params(m: torch.nn.Module):
+#                 return torch.cat([p.detach().float().view(-1).to(device) for p in m.parameters()])
+#             g_flat = flat_params(global_model)
+#             dists = []
+#             for c in clients:
+#                 c_flat = flat_params(c.model)
+#                 dists.append(torch.norm(c_flat - g_flat, p=2).item())
+#             if len(dists) > 1:
+#                 div_norm = float(np.std(dists) / (np.median(dists) + 1e-8))
+#             else:
+#                 div_norm = 0.0
+
+#         # ---- Aggregate & evaluate ----
+#         global_model = server.average([c.model for c in clients])
+#         last_acc = float(acc)
+#         acc, per_class = evaluate(global_model, device, test_loader)
+#         # running mean AULC up to round r
+#         aulc_running = ((aulc_running * r) + float(acc)) / max(1, (r + 1))
+
+#         # ---- Rollback check ----
+#         if acc < best_global_acc - V4_ROLLBACK_THR:
+#             # revert to best weights locally
+#             global_model.load_state_dict(best_state)
+#             acc, per_class = evaluate(global_model, device, test_loader)
+#             forgetting = np.maximum(0.0, best_recall - per_class)
+#             print(
+#                 f"[🔥 ROLLBACK r{r}] drop detected. Reverted to best (r{best_round}) acc={best_global_acc:.3f}",
+#                 flush=True,
+#             )
+#             rollback_flag = True
+#             rollback_round = r
+#         else:
+#             rollback_flag = False
+
+#         # ---- Update best state ----
+#         if acc > best_global_acc:
+#             best_global_acc = float(acc)
+#             best_state = copy.deepcopy(global_model.state_dict())
+#             best_hp = copy.deepcopy(hp)
+#             best_round = r
+
+#         # ---- Update loss/EMA/forgetting ----
+#         global_loss = evaluate_loss(global_model, device, test_loader)
+#         ema_loss = V4_EMA_ALPHA * global_loss + (1.0 - V4_EMA_ALPHA) * ema_loss
+#         forgetting = np.maximum(0.0, best_recall - per_class)
+#         best_recall = np.maximum(best_recall, per_class)
+
+#         # ---- Comm bytes for this round (used next round) ----
+#         model_size_bytes = sum(p.numel() for p in global_model.parameters()) * 4  # float32
+#         bytes_last_round = model_size_bytes * 2 * len(clients)  # up + down
+#         bytes_cum += int(bytes_last_round)
+
+#         # ---- Round summary log ----
+#         round_logs.append({
+#             "run_id": run_id, "tag": args.tag, "round": r,
+#             "global_acc": float(acc),
+#             "lr": float(hp["lr"]), "replay_ratio": float(hp["replay_ratio"]),
+#             "notes": hp.get("notes", ""),
+#             "global_loss": float(global_loss), "ema_loss": float(ema_loss),
+#             "forget_mean": float(np.mean(forgetting)), "divergence": float(div_norm),
+#             "best_acc_so_far": float(best_global_acc), "was_rollback": bool(rollback_flag),
+#             "comm_bytes_round": int(bytes_last_round),
+#             "aulc_running": float(aulc_running),
+#         })
+#         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
+
+#     # ---------------------------
+#     # Write CSVs
+#     # ---------------------------
+#     pd.DataFrame(run_logs).to_csv(f"fcl_run_results_{run_id}_{args.tag}.csv", index=False)
+#     pd.DataFrame(round_logs).to_csv(f"fcl_run_summary_{run_id}_{args.tag}.csv", index=False)
+#     pd.DataFrame(cl_rows).to_csv(f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", index=False)
+#     print("✓ Wrote CSVs:",
+#           f"fcl_run_results_{run_id}_{args.tag}.csv,",
+#           f"fcl_run_summary_{run_id}_{args.tag}.csv,",
+#           f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", flush=True)
 
 if __name__ == "__main__":
     main()
