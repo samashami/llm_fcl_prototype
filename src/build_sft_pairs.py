@@ -1,203 +1,168 @@
-#!/usr/bin/env python3
-"""
-Build SFT pairs from runs/* {state_round_*.json, action_round_*.json}.
-- Pairs each state with its action (same round, same run dir)
-- Sanitizes NaN/Inf -> 0.0
-- Adds simple deltas (delta_acc) and bytes_cum if missing
-- Flags "edge cases" and optionally oversamples them to target ratio
-- Writes:
-  - data/sft_pairs.jsonl   (one JSON per line)
-  - data/sft_stats.json    (counts, edge ratios)
-"""
+# src/build_sft_pairs.py
+import argparse, os, glob, json, math
+from dataclasses import dataclass
+from typing import List, Dict, Any
+import numpy as np
 
-import argparse, json, math, os, glob, re, random
-from collections import defaultdict
-# run_llm_fcl_controller.py
-from src._bootstrap_env import *  # sets TOKENIZERS_PARALLELISM=false early
+from src.agent_io import validate_action  # uses your existing clamp/validation
 
-def _is_num(x):
-    return isinstance(x, (int, float))
+V4_REP_MIN, V4_REP_MAX = 0.20, 0.70
+LR_SCALE_MIN, LR_SCALE_MAX = 0.8, 1.2
 
-def _sanitize_numbers(obj):
-    if isinstance(obj, dict):
-        return {k: _sanitize_numbers(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_numbers(v) for v in obj]
-    if _is_num(obj):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return float(obj)
-    return obj
+@dataclass
+class ClientSnap:
+    id: int
+    vloss: float | None
+    vacc: float | None
+    new_batch_size: int
+    last_lr: float
+    replay_capacity: int
+    last_replay_ratio: float
+    last_ewc_lambda: float
 
-def _load_json(path):
-    with open(path, "r") as f:
-        text = f.read()
-    # Python's json handles NaN by default in loads (maps to float('nan'))
-    obj = json.loads(text)
-    return _sanitize_numbers(obj)
-
-def _round_of(fname):
-    # .../state_round_3.json -> 3
-    m = re.search(r"round_(\d+)\.json$", fname)
-    return int(m.group(1)) if m else None
-
-def _edge_case_flags(state, prev_state, thr_forget=0.05, thr_div=0.15, thr_dacc=-0.02):
-    # Defaults if prev missing
-    acc    = float(state.get("global", {}).get("acc", 0.0))
-    prev_a = float(prev_state.get("global", {}).get("acc", acc)) if prev_state else acc
-    dacc   = acc - prev_a
-    forget_mean = float(state.get("global", {}).get("forget_mean", 0.0))
-    divergence  = float(state.get("global", {}).get("divergence", 0.0))
-
-    is_forget = forget_mean > thr_forget
-    is_div    = divergence  > thr_div
-    is_drop   = dacc        < thr_dacc
-
-    return {
-        "delta_acc": dacc,
-        "is_forget_spike": bool(is_forget),
-        "is_divergent": bool(is_div),
-        "is_acc_drop": bool(is_drop),
-        "edge_case": bool(is_forget or is_div or is_drop),
+def _compact_state_for_sft(state: Dict[str, Any]) -> Dict[str, Any]:
+    g = state["global"]
+    keep_g = {
+        "acc": float(g.get("acc", 0.0)),
+        "ema_loss": float(g.get("ema_loss", g.get("loss", 0.0))),
+        "forget_mean": float(g.get("forget_mean", 0.0)),
+        "divergence": float(g.get("divergence", 0.0)),
     }
-
-def _collect_run_pairs(run_dir):
-    """Return list of dicts with {round, state_path, action_path} for that run_dir."""
-    states  = sorted(glob.glob(os.path.join(run_dir, "state_round_*.json")))
-    actions = sorted(glob.glob(os.path.join(run_dir, "action_round_*.json")))
-    by_r_state  = { _round_of(p): p for p in states  if _round_of(p) is not None }
-    by_r_action = { _round_of(p): p for p in actions if _round_of(p) is not None }
-
-    rounds = sorted(set(by_r_state.keys()) & set(by_r_action.keys()))
-    out = []
-    for r in rounds:
-        out.append({
-            "round": r,
-            "state_path": by_r_state[r],
-            "action_path": by_r_action[r],
+    comp_clients = []
+    for c in state["clients"]:
+        vloss = c.get("vloss", None)
+        if isinstance(vloss, float) and math.isnan(vloss):
+            vloss = None
+        comp_clients.append({
+            "id": int(c["id"]),
+            "vloss": None if vloss is None else float(vloss),
+            "vacc": float(c.get("vacc", 0.0)),
+            "new_batch_size": int(c.get("new_batch_size", 0)),
+            "last_lr": float(c.get("last_lr", 0.0)),
         })
-    return out
+    return {"global": keep_g, "clients": comp_clients}
+
+def _ranked_lr_scales(vlosses: List[float | None]) -> List[float]:
+    """
+    Higher validation loss → needs more learning rate (toward 1.2).
+    If all None, return 1.0s.
+    """
+    clean = [np.inf if (v is None or np.isnan(v)) else float(v) for v in vlosses]
+    if all(v == np.inf for v in clean):
+        return [1.0 for _ in clean]
+
+    vmin, vmax = min(clean), max(clean)
+    span = max(1e-8, vmax - vmin)
+    # normalize: high vloss => rank ~1.0, low vloss => rank ~0.0
+    ranks = [(v - vmin) / span for v in clean]
+    # map rank -> [0.8, 1.2]
+    return [LR_SCALE_MIN + (1.0 - r) * (LR_SCALE_MAX - LR_SCALE_MIN) for r in ranks]
+
+def _teacher_action_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Heuristic teacher:
+      - Replay up if forgetting/divergence high; down if stable.
+      - Per-client lr_scale from vloss ranking.
+    """
+    g = state["global"]
+    F_t = float(g.get("forget_mean", 0.0))
+    div = float(g.get("divergence", 0.0))
+
+    # base replay
+    rep = 0.50
+    if F_t > 0.05 or div > 0.10:
+        rep += 0.10
+    elif F_t < 0.01 and div < 0.05:
+        rep -= 0.05
+    rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
+
+    vlosses = []
+    ids = []
+    for c in state["clients"]:
+        v = c.get("vloss", None)
+        if isinstance(v, float) and np.isnan(v):
+            v = None
+        vlosses.append(v)
+        ids.append(int(c["id"]))
+    scales = _ranked_lr_scales(vlosses)
+
+    action = {
+        "client_selection_k": len(ids),
+        "aggregation": {"method": "FedAvg"},
+        "client_params": [
+            {"id": cid, "replay_ratio": float(rep), "lr_scale": float(sc), "ewc_lambda": 0.0}
+            for cid, sc in zip(ids, scales)
+        ],
+    }
+    # Validate/clamp & tag for traceability (teacher)
+    return validate_action(action, n_clients=len(ids), policy_source="TeacherV0")
+
+def _is_edge_state(state: Dict[str, Any]) -> bool:
+    F_t = float(state["global"].get("forget_mean", 0.0))
+    div = float(state["global"].get("divergence", 0.0))
+    d_bad = (F_t > 0.05) or (div > 0.10)
+    return d_bad
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs_glob", default="runs/*", help="Glob to run directories")
-    ap.add_argument("--out_pairs", default="data/sft_pairs.jsonl")
-    ap.add_argument("--out_stats", default="data/sft_stats.json")
-    ap.add_argument("--target_edge_ratio", type=float, default=0.5,
-                    help="Oversample edge cases up to this fraction of the dataset (0..1)")
-    ap.add_argument("--thr_forget", type=float, default=0.05)
-    ap.add_argument("--thr_div", type=float, default=0.15)
-    ap.add_argument("--thr_dacc", type=float, default=-0.02)
-    ap.add_argument("--shuffle", action="store_true", default=True)
-    ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--runs_glob", type=str, default="runs/*", help="Where to scan for state_round_*.json")
+    ap.add_argument("--edge_ratio", type=float, default=0.5, help="Target fraction of 'edge' pairs")
+    ap.add_argument("--max_pairs", type=int, default=5000)
+    ap.add_argument("--out_jsonl", type=str, default="data/sft_pairs.jsonl")
+    ap.add_argument("--out_stats", type=str, default="data/sft_stats.json")
     args = ap.parse_args()
 
-    os.makedirs(os.path.dirname(args.out_pairs), exist_ok=True)
+    os.makedirs(os.path.dirname(args.out_jsonl), exist_ok=True)
 
-    run_dirs = sorted([p for p in glob.glob(args.runs_glob) if os.path.isdir(p)])
-    random.seed(args.seed)
+    state_paths = sorted(glob.glob(os.path.join(args.runs_glob, "state_round_*.json")))
+    pairs_edge, pairs_normal = [], []
 
-    all_rows = []
-    by_source_counts = defaultdict(int)
-    edge_count = 0
+    for sp in state_paths:
+        try:
+            with open(sp, "r") as f:
+                state = json.load(f)
+        except Exception:
+            continue
 
-    for rd in run_dirs:
-        pairs = _collect_run_pairs(rd)
-        # Load all states once to allow prev lookup
-        state_by_round = {}
-        for p in pairs:
-            s = _load_json(p["state_path"])
-            # add bytes_cum if missing
-            g = s.setdefault("global", {})
-            if "bytes_cum" not in g:
-                g["bytes_cum"] = float(g.get("bytes_last_round", 0.0))
-            state_by_round[p["round"]] = s
+        comp = _compact_state_for_sft(state)
+        action = _teacher_action_from_state(state)
+        pair = {"state": comp, "action": action}
 
-        # Accumulate bytes_cum realistically
-        cum = 0.0
-        for r in sorted(state_by_round.keys()):
-            g = state_by_round[r]["global"]
-            blr = float(g.get("bytes_last_round", 0.0))
-            cum += blr
-            g["bytes_cum"] = float(cum)
+        if _is_edge_state(state):
+            pairs_edge.append(pair)
+        else:
+            pairs_normal.append(pair)
 
-        for p in pairs:
-            r = p["round"]
-            state = state_by_round[r]
-            action = _load_json(p["action_path"])
-            source = action.get("policy_source", "Unknown")
+    # balance by edge_ratio
+    n_total = min(args.max_pairs, len(pairs_edge) + len(pairs_normal))
+    n_edge = min(int(round(args.edge_ratio * n_total)), len(pairs_edge))
+    n_norm = min(n_total - n_edge, len(pairs_normal))
 
-            prev_state = state_by_round.get(r-1)
-            flags = _edge_case_flags(state, prev_state,
-                                     thr_forget=args.thr_forget,
-                                     thr_div=args.thr_div,
-                                     thr_dacc=args.thr_dacc)
+    # if one bucket lacks, top up from the other
+    if n_edge < int(round(args.edge_ratio * n_total)):
+        need = int(round(args.edge_ratio * n_total)) - n_edge
+        n_norm = min(n_norm + need, len(pairs_normal))
+    elif n_norm < (n_total - n_edge):
+        need = (n_total - n_edge) - n_norm
+        n_edge = min(n_edge + need, len(pairs_edge))
 
-            row = {
-                "run_id": os.path.basename(rd),
-                "round": r,
-                "policy_source": source,
-                "state": state,
-                "action": action,
-                "delta_acc": flags["delta_acc"],
-                "edge_case": flags["edge_case"],
-                "edge_flags": {
-                    "forget_mean_gt_thr": flags["is_forget_spike"],
-                    "divergence_gt_thr": flags["is_divergent"],
-                    "acc_drop_lt_thr": flags["is_acc_drop"],
-                },
-            }
-            all_rows.append(row)
-            by_source_counts[source] += 1
-            if flags["edge_case"]:
-                edge_count += 1
+    sel = pairs_edge[:n_edge] + pairs_normal[:n_norm]
 
-    total = len(all_rows)
-    if total == 0:
-        print("No pairs found. Did you run any experiments?")
-        return
+    with open(args.out_jsonl, "w") as f:
+        for row in sel:
+            f.write(json.dumps(row) + "\n")
 
-    # Oversample edge cases up to target ratio
-    cur_edge_ratio = edge_count / max(1, total)
-    target_ratio   = max(0.0, min(1.0, args.target_edge_ratio))
-    print(f"[Info] Found {edge_count}/{total} edge pairs (ratio={cur_edge_ratio:.3f}). Target={target_ratio:.3f}")
-
-    if cur_edge_ratio < target_ratio and edge_count > 0:
-        need_total = int(round((total - edge_count) / (1 - target_ratio)))
-        need_edge  = max(0, need_total - edge_count)
-        edge_rows  = [r for r in all_rows if r["edge_case"]]
-        dup_rows   = []
-        while len(dup_rows) < need_edge:
-            dup_rows.append(random.choice(edge_rows))
-        all_rows = all_rows + dup_rows
-        print(f"[Info] Oversampled {len(dup_rows)} edge rows to reach ~{target_ratio:.2f} ratio "
-              f"(new total={len(all_rows)}).")
-
-    if args.shuffle:
-        random.shuffle(all_rows)
-
-    # Write pairs (JSONL)
-    with open(args.out_pairs, "w") as f:
-        for row in all_rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    # Stats
-    out_stats = {
-        "total_pairs": len(all_rows),
-        "by_policy_source": dict(by_source_counts),
-        "edge_pairs_original": edge_count,
-        "target_edge_ratio": target_ratio,
+    stats = {
+        "total_pairs": len(sel),
+        "by_bucket": {"edge": n_edge, "normal": n_norm},
+        "edge_pairs_original": len(pairs_edge),
+        "target_edge_ratio": args.edge_ratio,
     }
     with open(args.out_stats, "w") as f:
-        json.dump(out_stats, f, indent=2)
+        json.dump(stats, f, indent=2)
 
-    print(f"Wrote {args.out_pairs} ({len(all_rows)} lines)")
-    print(f"Wrote {args.out_stats}")
-    # Print a peek
-    with open(args.out_pairs, "r") as f:
-        for i, line in enumerate(f):
-            if i >= 3: break
-            print(line.strip())
+    print(f"Wrote {len(sel)} pairs → {args.out_jsonl}")
+    print(f"Wrote stats → {args.out_stats}")
 
 if __name__ == "__main__":
     main()
