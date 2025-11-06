@@ -9,6 +9,11 @@ from src.agent_io import validate_action  # uses your existing clamp/validation
 V4_REP_MIN, V4_REP_MAX = 0.20, 0.70
 LR_SCALE_MIN, LR_SCALE_MAX = 0.8, 1.2
 
+# ---- Edge-classification thresholds (tune as needed) ----
+EDGE_FORGET_THR = 0.003   # mean forgetting high
+EDGE_DIV_THR    = 0.003   # model divergence high
+EDGE_DACC_THR   = -0.003  # accuracy drop vs previous round
+
 @dataclass
 class ClientSnap:
     id: int
@@ -41,6 +46,23 @@ def _compact_state_for_sft(state: Dict[str, Any]) -> Dict[str, Any]:
             "last_lr": float(c.get("last_lr", 0.0)),
         })
     return {"global": keep_g, "clients": comp_clients}
+
+def _is_edge(curr_state: Dict[str, Any], prev_state: Dict[str, Any] | None) -> bool:
+    g = curr_state.get("global", {})
+    forget_mean = float(g.get("forget_mean", 0.0))
+    divergence  = float(g.get("divergence", 0.0))
+    acc_curr    = float(g.get("acc", 0.0))
+
+    acc_delta = 0.0
+    if prev_state is not None:
+        acc_prev = float(prev_state.get("global", {}).get("acc", acc_curr))
+        acc_delta = acc_curr - acc_prev
+
+    return (
+        forget_mean >= EDGE_FORGET_THR
+        or divergence >= EDGE_DIV_THR
+        or acc_delta <= EDGE_DACC_THR
+    )
 
 def _ranked_lr_scales(vlosses: List[float | None]) -> List[float]:
     """
@@ -121,17 +143,45 @@ def main():
         try:
             with open(sp, "r") as f:
                 state = json.load(f)
+                # figure out previous round path in the SAME run folder
+                dir_run = os.path.dirname(sp)                     # runs/<run_id>
+                fname = os.path.basename(sp)                      # state_round_<r>.json
+                r_idx = int(fname.split("_")[-1].split(".")[0])   # <r> as int
+
+                prev_state = None
+                if r_idx > 0:
+                    prev_path = os.path.join(dir_run, f"state_round_{r_idx-1}.json")
+                    if os.path.exists(prev_path):
+                        with open(prev_path, "r") as pf:
+                            prev_state = json.load(pf)
+
+                bucket = "edge" if _is_edge(state, prev_state) else "normal"
         except Exception:
             continue
 
         comp = _compact_state_for_sft(state)
-        action = _teacher_action_from_state(state)
-        pair = {"state": comp, "action": action}
 
-        if _is_edge_state(state):
-            pairs_edge.append(pair)
-        else:
-            pairs_normal.append(pair)
+        # 1) Build teacher action from current state
+        action = _teacher_action_from_state(state)
+
+        # 2) validate & clamp once
+        n_clients = len(state["clients"])
+        action = validate_action(action, n_clients=n_clients, policy_source="TeacherV0")
+
+        # 3) Create the training pair
+        pair = {
+            "state_small": comp,
+            "action": action,
+            "bucket": bucket,
+            "meta": {
+                "run_id": os.path.basename(dir_run),
+                "round": r_idx,
+                "source": "TeacherV0"
+            }
+        }
+
+        # 4) Append to the correct bucket list
+        (pairs_edge if bucket == "edge" else pairs_normal).append(pair)
 
     # balance by edge_ratio
     n_total = min(args.max_pairs, len(pairs_edge) + len(pairs_normal))
