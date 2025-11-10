@@ -1,4 +1,4 @@
-# src/policy.py
+# src/legacy_policy.py
 from typing import Dict, Any
 
 class Policy:
