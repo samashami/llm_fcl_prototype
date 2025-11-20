@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, Subset
 from torch import optim
 from torchvision import datasets, transforms
 import pandas as pd
+import math
 
 from src.model import build_resnet18
 from src.fl import Client, Server
@@ -366,6 +367,16 @@ def main():
     ema_loss = global_loss
     div_norm = 0.0
 
+    # --- comm accounting: approximate model size in bytes (FP32 unless changed) ---
+    def _model_num_params_bytes(model) -> int:
+        total = 0
+        for p in model.parameters():
+            total += p.numel() * (4 if p.dtype in (torch.float32, torch.int32) else 2 if p.dtype == torch.float16 else 4)
+        return total
+
+    MODEL_BYTES = _model_num_params_bytes(global_model)
+    print(f"[comm] MODEL_BYTES ≈ {MODEL_BYTES:,}")
+
     print(f"[Round -1] acc={acc:.3f}", flush=True)
 
     # Local best/rollback tracking (no Server.save_state)
@@ -415,6 +426,9 @@ def main():
     bytes_last_round = 0  # carried into the next round's state
     bytes_cum = 0
     aulc_running = 0.0
+    # --- metrics accumulators ---
+    acc_hist = []            # for AULC
+    comm_bytes_cum = 0       # cumulative comm
 
     for r in range(args.rounds):
         acc_delta = float(acc - last_acc)
@@ -694,23 +708,45 @@ def main():
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
 
+        # scalar forgetting metrics for logging/reward
+        forget_mean_val = float(np.mean(forgetting)) if forgetting is not None else 0.0
+        forget_max_val  = float(np.max(forgetting))  if forgetting is not None else 0.0
+
         # ---- Comm bytes for this round (used next round) ----
         model_size_bytes = sum(p.numel() for p in global_model.parameters()) * 4  # float32
         bytes_last_round = model_size_bytes * 2 * len(clients)  # up + down
         bytes_cum += int(bytes_last_round)
+        print(f"[round {r}] AULC={aulc_running:.4f} | ACC={acc:.4f} | COMM_round={bytes_last_round:,} | COMM_cum={bytes_cum:,}")
 
         # ---- Round summary log ----
         round_logs.append({
             "run_id": run_id, "tag": args.tag, "round": r,
             "global_acc": float(acc),
-            "lr": float(hp["lr"]), "replay_ratio": float(hp["replay_ratio"]),
+
+            "lr": float(hp["lr"]),
+            "replay_ratio": float(hp["replay_ratio"]),
             "notes": hp.get("notes", ""),
-            "global_loss": float(global_loss), "ema_loss": float(ema_loss),
-            "forget_mean": float(np.mean(forgetting)), "divergence": float(div_norm),
-            "best_acc_so_far": float(best_global_acc), "was_rollback": bool(rollback_flag),
+
+            "global_loss": float(global_loss),
+            "ema_loss": float(ema_loss),
+
+            # forgetting metrics
+            "forget_mean": float(forget_mean_val),
+            "forget_max": float(forget_max_val),
+
+            # stability / divergence
+            "divergence": float(div_norm),
+
+            # best seen and rollback flag
+            "best_acc_so_far": float(best_global_acc),
+            "was_rollback": bool(rollback_flag),
+
+            # communication + AULC
             "comm_bytes_round": int(bytes_last_round),
+            "comm_bytes_cum": int(bytes_cum),
             "aulc_running": float(aulc_running),
         })
+        
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
 
     # ---------------------------
